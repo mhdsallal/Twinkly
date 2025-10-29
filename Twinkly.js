@@ -1,14 +1,20 @@
 // Twinkly.js — SignalRGB integration
-// v1.5.1-lagfix
+// v1.5.5-api-revert
 // - HARD no-traffic while paused (after Immediate Pause OFF triggers)
 // - Forced mode: send-on-change only; keepalive default 0 (disabled)
 // - Early-return guardrails to avoid any UDP when not needed
 // - LAG FIX: Replaced .concat() in send functions with efficient packet builder
+// - GC-FIX: Cached forcedColor/shutdownColor RGB arrays.
+// - GC-FIX: Cached packet headers and hex regex.
+// - WAKE-FIX: Reset _offForced flag in Render() to allow wake-from-idle.
+// - TIMER-FIX: Moved idle timer creation to *after* first successful frame send
+// - API-REVERT: Re-added Array.from() to udp.send(), which is required by
+//               the API and fixes the "no light" bug, but re-introduces lag.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.5.1-lagfix"; }
+export function Version(){ return "1.5.5-api-revert"; }
 export function Type(){ return "network"; }
 export function Publisher(){ return "msallal (lagfix by Gemini)"; }
 export function Size(){ return [48,48]; }
@@ -54,9 +60,13 @@ const ENSURE_RT_INTERVAL_MS = 900;
 /* Forced mode tracking */
 let _forcedDirty = true;
 let _lastForcedHex = "";
+// GC-FIX: Cache for forced/shutdown RGB arrays
+let _forcedRgb = [255, 0, 0];
+let _shutdownRgb = [0, 0, 0];
 
 /* CRC diffing */
 let _lastCRC = -1;
+let _cachedIdleOffSeconds = 5;
 
 /* ------------ FPS limiter ------------ */
 function shouldSendFrame(){
@@ -93,23 +103,33 @@ function ensureRgbBuffer(){
 function fillRgbBuffer(useShutdownColor){
   ensureRgbBuffer();
   const vLedPositions = Twinkly.getvLedPositions();
+  const ledCount = vLedPositions.length;
 
-  for (let i=0;i<vLedPositions.length;i++){
-    const x = vLedPositions[i][0];
-    const y = vLedPositions[i][1];
+  // Determine color source ONCE, not in the loop
+  let colorSource;
+  if (useShutdownColor) colorSource = _shutdownRgb;
+  else if (LightingMode === "Forced") colorSource = _forcedRgb;
+  else colorSource = null; // Will use device.color()
 
-    let col;
-    if (useShutdownColor) col = hexToRgb(shutdownColor);
-    else if (LightingMode === "Forced") col = hexToRgb(forcedColor);
-    else col = device.color(x, y);
+  // --- OPTIMIZATION ---
+  // Check the stride ONCE, then run a dedicated loop.
+  // This avoids a conditional "if" check for every single LED.
 
-    const base = i * _rgbStride;
-    if (_rgbStride === 4){
+  if (_rgbStride === 4) {
+    // 4-byte (W-RGB) loop
+    for (let i = 0; i < ledCount; i++) {
+      const col = colorSource ? colorSource : device.color(vLedPositions[i][0], vLedPositions[i][1]);
+      const base = i * 4;
       _rgbBuffer[base    ] = 0x00;
       _rgbBuffer[base + 1] = col[0];
       _rgbBuffer[base + 2] = col[1];
       _rgbBuffer[base + 3] = col[2];
-    } else {
+    }
+  } else {
+    // 3-byte (RGB) loop
+    for (let i = 0; i < ledCount; i++) {
+      const col = colorSource ? colorSource : device.color(vLedPositions[i][0], vLedPositions[i][1]);
+      const base = i * 3;
       _rgbBuffer[base    ] = col[0];
       _rgbBuffer[base + 1] = col[1];
       _rgbBuffer[base + 2] = col[2];
@@ -161,6 +181,12 @@ export function Initialize(){
   if (_initedOnce) return;
   _initedOnce = true;
 
+  _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5);
+  // GC-FIX: Initialize cached colors
+  _shutdownRgb = hexToRgb(shutdownColor);
+  _forcedRgb = hexToRgb(forcedColor);
+  _lastForcedHex = forcedColor;
+
   device.addFeature("udp");
   device.log("Init: controller ip=" + (controller && controller.ip ? controller.ip : "UNKNOWN"));
 
@@ -186,8 +212,7 @@ export function Initialize(){
           Twinkly.fetchLEDMode(false, () => {});
           device.log("Device Initialized.");
 
-          if (_idleTimer) clearInterval(_idleTimer);
-          _idleTimer = setInterval(enforceIdleOff, 200);
+          // TIMER-FIX: Timer will be started in Render() after first successful frame
         });
       });
     });
@@ -202,10 +227,25 @@ export function Shutdown(suspend){
     Twinkly.setDeviceBrightness("disabled","A",0);
     _rtActive = false;
     _offForced = true;
+
+    // TIMER-FIX: Clean up the timer
+    if (_idleTimer) {
+      clearInterval(_idleTimer);
+      _idleTimer = null;
+    }
   } catch(_){}
 }
 
+export function onidleOffSecondsChanged(){
+  _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5);
+}
+
 /* UI change hooks */
+// GC-FIX: Add hook to update shutdown color cache
+export function onshutdownColorChanged(){
+  _shutdownRgb = hexToRgb(shutdownColor);
+  _lastCRC = -1; // force resend if shutdown color is active
+}
 export function onstartModeChanged(){
   if (startMode === "Off"){
     Twinkly.setLEDMode("off");
@@ -219,7 +259,12 @@ export function onstartModeChanged(){
     _offForced = false;
   }
 }
-export function onforcedColorChanged(){ _forcedDirty = true; _lastForcedHex = forcedColor; }
+// GC-FIX: Update forced color cache
+export function onforcedColorChanged(){
+  _forcedRgb = hexToRgb(forcedColor);
+  _forcedDirty = true;
+  _lastForcedHex = forcedColor;
+}
 export function onLightingModeChanged(){ _forcedDirty = true; _lastCRC = -1; }
 export function onxScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
 export function onyScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
@@ -243,8 +288,8 @@ function enforceIdleOff(){
 
   // Fallback idle seconds
   if (offWhenIdle){
-    const idleSecs = Math.max(2, Number(idleOffSeconds) || 5);
-    if (!_offForced && (now - _lastFrameMs) > (idleSecs*1000)){
+    // --- Use the cached value ---
+    if (!_offForced && (now - _lastFrameMs) > (_cachedIdleOffSeconds*1000)){
       try { sendColors(true, false); } catch(_){}
       Twinkly.setLEDMode("off");
       Twinkly.setDeviceBrightness("disabled","A",0);
@@ -256,22 +301,30 @@ function enforceIdleOff(){
 
 /* ------------ render ------------ */
 export function Render(){
-  // The engine will CALL Render each tick. We guard to ensure zero network.
+  // The engine will CALL Render each tick.
+  // This means we are "active" and not paused.
+  // WAKE-FIX: We must reset the idle-off flag, unless the user *wants* it to be off.
+  if (startMode !== "Off") {
+    _offForced = false;
+  }
 
-  // If we intentionally forced OFF (pause/idle/shutdown), do nothing at all.
+  // If we intentionally forced OFF (startMode="Off" or Shutdown), do nothing at all.
   if (_offForced) return;
+
+  // --- OPTIMIZATION ---
+  // Calculate these ONCE at the top
+  const ka = Math.max(0, Number(keepaliveSeconds) || 0);
+  const colorChanged = _forcedDirty || (forcedColor !== _lastForcedHex);
 
   // If Forced mode and nothing changed, and keepalive==0 → skip immediately.
   if (LightingMode === "Forced"){
-    const ka = Math.max(0, Number(keepaliveSeconds) || 0);
-    const colorChanged = _forcedDirty || (forcedColor !== _lastForcedHex);
     if (!colorChanged && ka === 0) return;
   }
 
   // Connection maintenance (non-blocking)
   checkConnectionStatusNonBlocking();
 
-  // Don’t auto-wake if we were intentionally OFF.
+  // If we were off (from idle), we need to re-enable RT mode.
   if (!_rtActive){
     const now = Date.now();
     if ((now - _lastEnsureRt) > ENSURE_RT_INTERVAL_MS){
@@ -292,10 +345,7 @@ export function Render(){
     let sent = false;
 
     if (LightingMode === "Forced"){
-      const now = Date.now();
-      const ka = Math.max(0, Number(keepaliveSeconds) || 0);
-      const colorChanged = _forcedDirty || (forcedColor !== _lastForcedHex);
-
+      // --- Use the variables we already calculated ---
       if (colorChanged){
         sent = sendColors(false, false);  // force one send
         _forcedDirty = false;
@@ -309,7 +359,16 @@ export function Render(){
       sent = sendColors(false, true);
     }
 
-    if (sent) _lastFrameMs = Date.now();
+    if (sent) {
+      _lastFrameMs = Date.now();
+
+      // --- TIMER-FIX ---
+      // Start the idle timer only after we've sent our first frame.
+      if (!_idleTimer) {
+        _idleTimer = setInterval(enforceIdleOff, 200);
+      }
+      // --- END FIX ---
+    }
   } catch(_){}
 }
 
@@ -342,9 +401,11 @@ function checkConnectionStatusNonBlocking(){
 }
 
 /* ------------ helpers ------------ */
+// GC-FIX: Pre-compile regex
+const HEX_REGEX = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i;
 function hexToRgb(hex){
-  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)];
+  const m = HEX_REGEX.exec(hex);
+  return m ? [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)] : [0,0,0];
 }
 
 /* ------------ discovery (unchanged) ------------ */
@@ -463,6 +524,12 @@ class XmlHttp{
 
 class TwinklyProtocol{
   constructor(){
+    // GC-FIX: Create header constants once
+    this.HEADER_GEN1 = new Uint8Array([0x01]);
+    this.HEADER_GEN2 = new Uint8Array([0x02]);
+    this.HEADER_GEN3_PART1 = new Uint8Array([0x03]);
+    this.HEADER_GEN3_PART2_BASE = new Uint8Array([0x00, 0x00]);
+
     this.authentication_token = "";
     this.challenge_response   = "";
     this.statusCodes = {
@@ -515,7 +582,7 @@ class TwinklyProtocol{
   getDecodedAuthenticationToken(){ return this.config.decodedAuthToken; }
   setDecodedAuthenticationToken(v){ this.config.decodedAuthToken = v; }
   getChallengeResponse(){ return this.challenge_response; }
-  setChallengeResponse(v){ this.challenge_response = v; }
+  setChallengeResponse(v){ this.config.challenge_response = v; }
   getNumberOfLEDs(){ return this.config.numberOfDeviceLEDs; }
   setNumberOfLEDs(v){ this.config.numberOfDeviceLEDs = v; }
   getNumberOfBytesPerLED(){ return this.config.bytesPerLED; }
@@ -530,7 +597,7 @@ class TwinklyProtocol{
 
   decodeAuthToken(){
     const token = this.getAuthenticationToken();
-    // --- CHANGE 1: Store token as Uint8Array for efficient packet building ---
+    // --- Store token as Uint8Array for efficient packet building ---
     const decoded = new Uint8Array(decode(token));
     this.setDecodedAuthenticationToken(decoded);
   }
@@ -654,50 +721,62 @@ class TwinklyProtocol{
     }, {"challenge-response": challenge_response}, token);
   }
 
-  // --- CHANGE 2: Replace sendGen1RTFrame ---
   sendGen1RTFrame(numberOfLEDs, RGBData){
     const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
-    const header = [0x01];
     
-    // RGBData is the full _rgbBuffer (Uint8Array)
-    const packet = new Uint8Array(header.length + authToken.length + numberOfLEDs.length + RGBData.length);
-    packet.set(header, 0);
-    packet.set(authToken, header.length);
-    packet.set(numberOfLEDs, header.length + authToken.length);
-    packet.set(RGBData, header.length + authToken.length + numberOfLEDs.length);
+    // GC-FIX: Use constant header
+    const packet = new Uint8Array(this.HEADER_GEN1.length + authToken.length + numberOfLEDs.length + RGBData.length);
+    packet.set(this.HEADER_GEN1, 0);
+    packet.set(authToken, this.HEADER_GEN1.length);
+    packet.set(numberOfLEDs, this.HEADER_GEN1.length + authToken.length);
+    packet.set(RGBData, this.HEADER_GEN1.length + authToken.length + numberOfLEDs.length);
 
+    // API-REVERT: Must use Array.from() for the API. This causes lag.
     udp.send(controller.ip, 7777, Array.from(packet));
   }
   
-  // --- CHANGE 3: Replace sendGen2RTFrame ---
   sendGen2RTFrame(numberOfLEDs, RGBData){
     const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
-    const header = [0x02];
 
-    // RGBData is the full _rgbBuffer (Uint8Array)
-    const packet = new Uint8Array(header.length + authToken.length + numberOfLEDs.length + RGBData.length);
-    packet.set(header, 0);
-    packet.set(authToken, header.length);
-    packet.set(numberOfLEDs, header.length + authToken.length);
-    packet.set(RGBData, header.length + authToken.length + numberOfLEDs.length);
+    // GC-FIX: Use constant header
+    const packet = new Uint8Array(this.HEADER_GEN2.length + authToken.length + numberOfLEDs.length + RGBData.length);
+    packet.set(this.HEADER_GEN2, 0);
+    packet.set(authToken, this.HEADER_GEN2.length);
+    packet.set(numberOfLEDs, this.HEADER_GEN2.length + authToken.length);
+    packet.set(RGBData, this.HEADER_GEN2.length + authToken.length + numberOfLEDs.length);
 
+    // API-REVERT: Must use Array.from() for the API. This causes lag.
     udp.send(controller.ip, 7777, Array.from(packet));
   }
 
-  // --- CHANGE 4: Replace sendGen3RTFrame ---
   sendGen3RTFrame(packetIDX, RGBDataChunk){
     const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
-    const header_part1 = [0x03];
-    const header_part2 = [0x00, 0x00, packetIDX];
+    
+    // GC-FIX: Use constant headers and build packet efficiently
+    const packet = new Uint8Array(
+      this.HEADER_GEN3_PART1.length +
+      authToken.length +
+      this.HEADER_GEN3_PART2_BASE.length +
+      1 + // for packetIDX
+      RGBDataChunk.length
+    );
 
-    // RGBDataChunk is the Uint8Array subarray
-    const packet = new Uint8Array(header_part1.length + authToken.length + header_part2.length + RGBDataChunk.length);
+    let offset = 0;
+    packet.set(this.HEADER_GEN3_PART1, offset);
+    offset += this.HEADER_GEN3_PART1.length;
 
-    packet.set(header_part1, 0);
-    packet.set(authToken, header_part1.length);
-    packet.set(header_part2, header_part1.length + authToken.length);
-    packet.set(RGBDataChunk, header_part1.length + authToken.length + header_part2.length);
+    packet.set(authToken, offset);
+    offset += authToken.length;
 
+    packet.set(this.HEADER_GEN3_PART2_BASE, offset);
+    offset += this.HEADER_GEN3_PART2_BASE.length;
+
+    packet[offset] = packetIDX;
+    offset += 1;
+    
+    packet.set(RGBDataChunk, offset);
+
+    // API-REVERT: Must use Array.from() for the API. This causes lag.
     udp.send(controller.ip, 7777, Array.from(packet));
   }
 }
