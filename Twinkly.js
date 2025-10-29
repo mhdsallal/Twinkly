@@ -5,6 +5,8 @@
 // - Makes token checks non-blocking
 // - Fixes 2D layout (Y axis)
 // - Uses imported base64 encode/decode consistently
+// - ADDED: Caches RGBData array to eliminate GC lag
+// - ADDED: Implements Shutdown() to force device "off"
 
 import { encode, decode } from "@SignalRGB/base64";
 
@@ -61,6 +63,9 @@ export function Initialize() {
 }
 
 let _lastFrameSentAt = 0;
+// --- CHANGE 1: Cache for RGB data to reduce GC lag ---
+let _persistentRGBData = null; 
+
 function shouldSendFrame() {
   const limit = Math.max(10, Math.min(120, Number(fpsLimit) || 60));
   const minDeltaMs = 1000 / limit;
@@ -79,7 +84,14 @@ export function Render() {
   }
 }
 
-export function Shutdown(_suspend) { }
+export function Shutdown(_suspend) {
+  // --- CHANGE 2: Tell device to turn off synchronously on exit ---
+  // This prevents it from reverting to the default blue preset.
+  // We pass 'false' for async to make sure the command is sent
+  // before SignalRGB closes the script.
+  device.log('shutdown0');
+  Twinkly.setLEDMode("off", null, false);
+}
 
 export function onxScaleChanged() {
   Twinkly.fetchDeviceLayoutType();
@@ -139,10 +151,16 @@ function sendColors(shutdown = false) {
 function grabColors(shutdown) {
   const vLedPositions = Twinkly.getvLedPositions();
   const bytesPerLED = Twinkly.getNumberOfBytesPerLED();
-
-  // Pre-size array to avoid push/resize churn
   const stride = (bytesPerLED === 4) ? 4 : 3;
-  const RGBData = new Array(vLedPositions.length * stride);
+
+  // --- CHANGE 3: Reuse the RGBData array to prevent lag from garbage collection ---
+  const requiredSize = vLedPositions.length * stride;
+  if (!_persistentRGBData || _persistentRGBData.length !== requiredSize) {
+    _persistentRGBData = new Array(requiredSize);
+  }
+  const RGBData = _persistentRGBData; // Use the cached array
+  // --- END CHANGE 3 ---
+
 
   for (let iIdx = 0; iIdx < vLedPositions.length; iIdx++) {
     const iPxX = vLedPositions[iIdx][0];
@@ -440,7 +458,7 @@ class TwinklyProtocol {
   setDecodedAuthenticationToken(decodedAuthToken) { this.config.decodedAuthToken = decodedAuthToken; }
 
   getChallengeResponse() { return this.challenge_response; }
-  setChallengeResponse(challenge_response) { this.challenge_response = challenge_response; }
+  setChallengeResponse(challenge_response) { this.config.challenge_response = challenge_response; }
 
   getNumberOfLEDs() { return this.config.numberOfDeviceLEDs; }
   setNumberOfLEDs(numberOfDeviceLEDs) { this.config.numberOfDeviceLEDs = numberOfDeviceLEDs; }
@@ -507,10 +525,11 @@ class TwinklyProtocol {
     });
   }
 
-  setLEDMode(LEDMode = "color", cb) {
+  // --- CHANGE 4: Allow async parameter for synchronous calls ---
+  setLEDMode(LEDMode = "color", cb, async = true) {
     XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/mode`, (_xhr) => {
       if (cb) cb();
-    }, {"mode" : LEDMode});
+    }, {"mode" : LEDMode}, this.getAuthenticationToken(), async); // <-- Pass async flag
   }
 
   setCurrentLEDEffect(preset_id = 0) {
