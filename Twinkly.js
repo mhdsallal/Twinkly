@@ -1,5 +1,5 @@
 // Twinkly.js — SignalRGB integration
-// v1.5.9-parse-fix
+// v1.6.0-aspect-fix
 // - HARD no-traffic while paused (after Immediate Pause OFF triggers)
 // - Forced mode: send-on-change only; keepalive default 0 (disabled)
 // - Early-return guardrails to avoid any UDP when not needed
@@ -16,14 +16,14 @@
 // - CRASH-FIX: Implemented proper layout normalization in configureDeviceLayout
 // - DEFAULT-FIX: Changed default scale (2) and position (10,10) to prevent 
 //                layout crash with multi-panel setups.
-// - PARSE-FIX: Wrapped all JSON.parse() calls in try...catch blocks
-//              and added xhr.response checks to prevent parse errors.
-// - PARSE-FIX: Fixed XmlHttp..Get typo.
+// - PARSE-FIX: Wrapped all JSON.parse() calls in try...catch blocks.
+// - ASPECT-FIX: Corrected normalization math to preserve aspect ratio,
+//               fixing distorted layouts on multi-panel setups.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.5.9-parse-fix"; }
+export function Version(){ return "1.6.0-aspect-fix"; }
 export function Type(){ return "network"; }
 export function Publisher(){ return "msallal (lagfix by Gemini)"; }
 export function Size(){ return [48,48]; }
@@ -623,7 +623,7 @@ class TwinklyProtocol{
     this.setDecodedAuthenticationToken(decoded);
   }
 
-  // PARSE-FIX: Fixed typo XmlHttp..Get and wrapped parse in try...catch
+  // PARSE-FIX: Wrapped parse in try...catch
   fetchFirmwareVersionFromDevice(cb){
     XmlHttp.Get(`http://${controller.ip}/xled/v1/fw/version`, (xhr)=>{
       try {
@@ -740,27 +740,30 @@ class TwinklyProtocol{
     });
   }
 
-  // CRASH-FIX: Updated function to properly normalize multi-panel layouts
+  // ASPECT-FIX: This is the main fix for the messed up layout.
   configureDeviceLayout(packet, xMin, xMax, yMin, yMax){
     const names = [], pos = [];
     const width = 10 * xScale + 1;
     const height = 10 * yScale + 1;
     
-    // Calculate the range, avoid division by zero
+    // Calculate the range of each axis
     const xRange = (xMax - xMin) || 1; 
     const yRange = (yMax - yMin) || 1;
+    
+    // Find the largest range to preserve aspect ratio
+    const maxRange = Math.max(xRange, yRange);
+
     const useZ = (packet.source === "3d");
 
-    // The scale `5` was a typo, it should match the width logic `10`.
     const scaledWidth = 10 * xScale; 
     const scaledHeight = 10 * yScale;
 
     for (let i=0;i<packet.coordinates.length;i++){
       const c = packet.coordinates[i];
       
-      // Normalize the coordinate from [min...max] to [0...1]
-      const xNorm = (c.x - xMin) / xRange;
-      const yNorm = ((useZ ? c.z : c.y) - yMin) / yRange;
+      // Normalize both axes by the *same* maximum range
+      const xNorm = (c.x - xMin) / maxRange;
+      const yNorm = ((useZ ? c.z : c.y) - yMin) / maxRange;
 
       // Scale the [0...1] value to the canvas size
       const X = Math.round(xNorm * scaledWidth);
