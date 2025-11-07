@@ -1,5 +1,5 @@
 // Twinkly.js — SignalRGB integration
-// v1.6.0-aspect-fix
+// v1.6.1-final-layout
 // - HARD no-traffic while paused (after Immediate Pause OFF triggers)
 // - Forced mode: send-on-change only; keepalive default 0 (disabled)
 // - Early-return guardrails to avoid any UDP when not needed
@@ -14,16 +14,17 @@
 // - OPTIMIZE: Cleaned up redundant variable creation in Render().
 // - TOKEN-FIX: Fixed typo in fetchLEDMode (this.statuses -> this.statusCodes)
 // - CRASH-FIX: Implemented proper layout normalization in configureDeviceLayout
-// - DEFAULT-FIX: Changed default scale (2) and position (10,10) to prevent 
+// - DEFAULT-FIX: Changed default scale (2) and position (10,10) to prevent
 //                layout crash with multi-panel setups.
 // - PARSE-FIX: Wrapped all JSON.parse() calls in try...catch blocks.
-// - ASPECT-FIX: Corrected normalization math to preserve aspect ratio,
-//               fixing distorted layouts on multi-panel setups.
+// - LAYOUT-FIX: Re-wrote layout logic to correctly calculate and apply the
+//               aspect ratio of the physical device to the virtual canvas,
+//               eliminating distortion and empty space.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.6.0-aspect-fix"; }
+export function Version(){ return "1.6.1-final-layout"; }
 export function Type(){ return "network"; }
 export function Publisher(){ return "msallal (lagfix by Gemini)"; }
 export function Size(){ return [48,48]; }
@@ -740,34 +741,37 @@ class TwinklyProtocol{
     });
   }
 
-  // ASPECT-FIX: This is the main fix for the messed up layout.
+  // LAYOUT-FIX: This is the main fix for the messed up layout.
   configureDeviceLayout(packet, xMin, xMax, yMin, yMax){
     const names = [], pos = [];
-    const width = 10 * xScale + 1;
-    const height = 10 * yScale + 1;
     
-    // Calculate the range of each axis
     const xRange = (xMax - xMin) || 1; 
     const yRange = (yMax - yMin) || 1;
     
-    // Find the largest range to preserve aspect ratio
-    const maxRange = Math.max(xRange, yRange);
+    let finalWidth, finalHeight;
+    // Determine the final canvas dimensions based on the aspect ratio of the physical layout
+    if (xRange > yRange) {
+        // Layout is wider than it is tall (landscape)
+        finalWidth = 10 * xScale;
+        finalHeight = finalWidth * (yRange / xRange);
+    } else {
+        // Layout is taller than it is wide (portrait or square)
+        finalHeight = 10 * yScale;
+        finalWidth = finalHeight * (xRange / yRange);
+    }
 
     const useZ = (packet.source === "3d");
 
-    const scaledWidth = 10 * xScale; 
-    const scaledHeight = 10 * yScale;
-
-    for (let i=0;i<packet.coordinates.length;i++){
+    for (let i=0; i<packet.coordinates.length; i++){
       const c = packet.coordinates[i];
       
-      // Normalize both axes by the *same* maximum range
-      const xNorm = (c.x - xMin) / maxRange;
-      const yNorm = ((useZ ? c.z : c.y) - yMin) / maxRange;
+      // Normalize each coordinate from [min...max] to [0...1]
+      const xNorm = (c.x - xMin) / xRange;
+      const yNorm = ((useZ ? c.z : c.y) - yMin) / yRange;
 
-      // Scale the [0...1] value to the canvas size
-      const X = Math.round(xNorm * scaledWidth);
-      const Y = Math.round(yNorm * scaledHeight);
+      // Scale the normalized coordinate to the final calculated canvas size
+      const X = Math.round(xNorm * finalWidth);
+      const Y = Math.round(yNorm * finalHeight);
 
       pos.push([X,Y]);
       names.push(`LED ${i+1}`);
@@ -775,7 +779,8 @@ class TwinklyProtocol{
 
     this.setvLedNames(names);
     this.setvLedPositions(pos);
-    device.setSize([width, height]);
+    // Set the device's bounding box to the perfectly calculated aspect ratio
+    device.setSize([Math.round(finalWidth) + 1, Math.round(finalHeight) + 1]);
     device.setControllableLeds(this.getvLedNames(), this.getvLedPositions());
     ensureRgbBuffer();
   }
