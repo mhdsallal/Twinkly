@@ -37,8 +37,8 @@ export function ControllableParameters(){
 
     {"property":"autoReconnect","group":"network","label":"Auto Reconnect When Lost","type":"boolean","default":true},
 
-    {"property":"xScale","group":"layout","label":"Width Scale","step":"1","type":"number","min":"1","max":"10","default":"5"},
-    {"property":"yScale","group":"layout","label":"Height Scale","step":"1","type":"number","min":"1","max":"10","default":"5"},
+    {"property":"xScale","group":"layout","label":"Width Scale","step":"1","type":"number","min":"1","max":"10","default":"1"},
+    {"property":"yScale","group":"layout","label":"Height Scale","step":"1","type":"number","min":"1","max":"10","default":"1"},
 
     {"property":"fpsLimit","group":"performance","label":"Max FPS","step":"1","type":"number","min":"10","max":"120","default":"45"},
     {"property":"keepaliveSeconds","group":"performance","label":"Keepalive Seconds (Forced mode)","step":"1","type":"number","min":"0","max":"120","default":"0"}
