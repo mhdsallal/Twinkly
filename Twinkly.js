@@ -1,5 +1,5 @@
 // Twinkly.js — SignalRGB integration
-// v1.6.1-final-layout
+// v1.6.2-wakefix
 // - HARD no-traffic while paused (after Immediate Pause OFF triggers)
 // - Forced mode: send-on-change only; keepalive default 0 (disabled)
 // - Early-return guardrails to avoid any UDP when not needed
@@ -18,13 +18,13 @@
 //                layout crash with multi-panel setups.
 // - PARSE-FIX: Wrapped all JSON.parse() calls in try...catch blocks.
 // - LAYOUT-FIX: Re-wrote layout logic to correctly calculate and apply the
-//               aspect ratio of the physical device to the virtual canvas,
-//               eliminating distortion and empty space.
+//               aspect ratio of the physical device to the virtual canvas.
+// - WAKE-FIX: Added logic to force a re-login immediately on wake from sleep.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.6.1-final-layout"; }
+export function Version(){ return "1.6.2-wakefix"; }
 export function Type(){ return "network"; }
 export function Publisher(){ return "msallal (lagfix by Gemini)"; }
 export function Size(){ return [48,48]; }
@@ -81,6 +81,9 @@ let _lastCRC = -1;
 
 /* OPTIMIZE: Cache idle seconds */
 let _cachedIdleOffSeconds = 5;
+
+// WAKE-FIX: Flag to force re-login
+let _forceRelogin = false;
 
 /* ------------ FPS limiter ------------ */
 function shouldSendFrame(){
@@ -322,6 +325,17 @@ export function Render(){
   if (startMode !== "Off") {
     _offForced = false;
   }
+  
+  // --- WAKE-FROM-SLEEP FIX ---
+  // If it's been a while since our last frame, we probably just woke up.
+  // Force a re-login check.
+  const now = Date.now();
+  const WAKE_THRESHOLD_MS = 5000; // 5 seconds
+  if ((now - _lastFrameMs) > WAKE_THRESHOLD_MS && _lastFrameMs !== 0) {
+    _forceRelogin = true;
+    _lastFrameMs = now; // Reset timer to prevent spamming
+  }
+  // --- END FIX ---
 
   // If we intentionally forced OFF (startMode="Off" or Shutdown), do nothing at all.
   if (_offForced) return;
@@ -341,12 +355,12 @@ export function Render(){
 
   // If we were off (from idle), we need to re-enable RT mode.
   if (!_rtActive){
-    const now = Date.now();
-    if ((now - _lastEnsureRt) > ENSURE_RT_INTERVAL_MS){
+    const now_rt = Date.now(); // Use a different var name just in case
+    if ((now_rt - _lastEnsureRt) > ENSURE_RT_INTERVAL_MS){
       Twinkly.setDeviceBrightness("enabled","A",100);
       Twinkly.setLEDMode("rt");
       _rtActive = true;
-      _lastEnsureRt = now;
+      _lastEnsureRt = now_rt;
     }
   }
 
@@ -394,9 +408,15 @@ let _checking = false;
 
 function checkConnectionStatusNonBlocking(){
   const now = Date.now();
-  if (_checking || (now - lastConnectionCheckAt) < connectionCheckIntervalMs) return;
+  
+  // --- WAKE-FROM-SLEEP FIX ---
+  // If we aren't forcing a relogin, respect the timer.
+  // Otherwise, bypass the timer and run the check *now*.
+  if (!_forceRelogin && (_checking || (now - lastConnectionCheckAt) < connectionCheckIntervalMs)) return;
 
   _checking = true;
+  _forceRelogin = false; // Consume the flag
+
   Twinkly.fetchLEDMode(true, (status) => {
     if (status !== "Ok" && autoReconnect){
       Twinkly.deviceLogin(() => {
@@ -749,14 +769,17 @@ class TwinklyProtocol{
     const yRange = (yMax - yMin) || 1;
     
     let finalWidth, finalHeight;
+    const baseWidth = 10 * xScale;
+    const baseHeight = 10 * yScale;
+
     // Determine the final canvas dimensions based on the aspect ratio of the physical layout
     if (xRange > yRange) {
         // Layout is wider than it is tall (landscape)
-        finalWidth = 10 * xScale;
+        finalWidth = baseWidth;
         finalHeight = finalWidth * (yRange / xRange);
     } else {
         // Layout is taller than it is wide (portrait or square)
-        finalHeight = 10 * yScale;
+        finalHeight = baseHeight;
         finalWidth = finalHeight * (xRange / yRange);
     }
 
