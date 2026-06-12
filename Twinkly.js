@@ -531,20 +531,20 @@ class TwinklyProtocol{
       "TWS100SPP":"Strings","TWS250STP":"Strings","TWS600STP":"Strings"
     };
     this.deviceImageLibrary = {
-      "Clusters":"https://assets.signalrgb.com/devices/brands/twinkly/cluster-multicolor-edition.png",
-      "Curtain":"https://assets.signalrgb.com/devices/brands/twinkly/curtain-multicolor-white-edition.png",
-      "Dots":"https://assets.signalrgb.com/devices/brands/twinkly/dots-multicolor-edition.png",
-      "Festoon":"https://assets.signalrgb.com/devices/brands/twinkly/festoon-multicolor-edition.png",
-      "Flex":"https://assets.signalrgb.com/devices/brands/twinkly/flex-multicolor-edition.png",
-      "Icicle":"https://assets.signalrgb.com/devices/brands/twinkly/icicle-multicolor-edition.png",
-      "Light Tree":"https://assets.signalrgb.com/devices/brands/twinkly/light-tree-3d-multicolor-edition.png",
-      "Line":"https://assets.signalrgb.com/devices/brands/twinkly/line-multicolor-edition.png",
-      "Garland":"https://assets.signalrgb.com/devices/brands/twinkly/prelit-garland-multicolor-edition.png",
-      "Prelit Tree":"https://assets.signalrgb.com/devices/brands/twinkly/prelit-tree-multicolor-edition.png",
-      "Prelit Wreath":"https://assets.signalrgb.com/devices/brands/twinkly/prelit-wreath-multicolor-edition.png",
-      "Spritzer":"https://assets.signalrgb.com/devices/brands/twinkly/spritzer-multicolor-edition.png",
-      "Squares":"https://assets.signalrgb.com/devices/brands/twinkly/squares-multicolor-edition.png",
-      "Strings":"https://assets.signalrgb.com/devices/brands/twinkly/strings-multicolor-edition.png"
+			"Clusters" : "https://assets.signalrgb.com/devices/brands/twinkly/clusters.png",
+			"Curtain" : "https://assets.signalrgb.com/devices/brands/twinkly/curtain.png",
+			"Dots" : "https://assets.signalrgb.com/devices/brands/twinkly/dots.png",
+			"Festoon" : "https://assets.signalrgb.com/devices/brands/twinkly/festoon.png",
+			"Flex" : "https://assets.signalrgb.com/devices/brands/twinkly/flex.png",
+			"Icicle" : "https://assets.signalrgb.com/devices/brands/twinkly/icicle.png",
+			"Light Tree" : "https://assets.signalrgb.com/devices/brands/twinkly/light-tree.png",
+			"Line" : "https://assets.signalrgb.com/devices/brands/twinkly/lines.png",
+			"Garland" : "https://assets.signalrgb.com/devices/brands/twinkly/garland.png",
+			"Prelit Tree" : "https://assets.signalrgb.com/devices/brands/twinkly/prelit-tree.png",
+			"Prelit Wreath" : "https://assets.signalrgb.com/devices/brands/twinkly/wreath.png",
+			"Spritzer" : "https://assets.signalrgb.com/devices/brands/twinkly/spritzer.png",
+			"Squares" : "https://assets.signalrgb.com/devices/brands/twinkly/squares.png",
+			"Strings" : "https://assets.signalrgb.com/devices/brands/twinkly/strings.png"
     };
   }
   getvLedNames(){ return this.config.vLedNames; }
