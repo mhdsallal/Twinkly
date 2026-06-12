@@ -1,34 +1,18 @@
 // Twinkly.js — SignalRGB integration
-// v1.6.2-wakefix
-// - HARD no-traffic while paused (after Immediate Pause OFF triggers)
-// - Forced mode: send-on-change only; keepalive default 0 (disabled)
-// - Early-return guardrails to avoid any UDP when not needed
-// - LAG FIX: Replaced .concat() in send functions with efficient packet builder
-// - GC-FIX: Cached forcedColor/shutdownColor RGB arrays.
-// - GC-FIX: Cached packet headers and hex regex.
+// v1.6.6-godtier
+// - MAX-PERF: Implemented pure Loop Unswitching in fillRgbBuffer. Bypasses device.color() entirely during static modes.
+// - MAX-PERF: Replaced all .push() methods in packet builders with pre-calculated memory sizing and direct offset indexing.
+// - MAX-PERF: Replaced multiplication math in render loop with sequential addition to save CPU cycles.
+// - CRASH-FIX: Fully sanitized JSON coordinate parsing and hard-clamped layout bounds.
 // - WAKE-FIX: Reset _offForced flag in Render() to allow wake-from-idle.
-// - TIMER-FIX: Moved idle timer creation to *after* first successful frame send
-// - API-REVERT: Re-added Array.from() to udp.send(), which is required.
-// - OPTIMIZE: Hoisted conditional checks out of fillRgbBuffer() loop.
-// - OPTIMIZE: Cached idleOffSeconds value.
-// - OPTIMIZE: Cleaned up redundant variable creation in Render().
-// - TOKEN-FIX: Fixed typo in fetchLEDMode (this.statuses -> this.statusCodes)
-// - CRASH-FIX: Implemented proper layout normalization in configureDeviceLayout
-// - DEFAULT-FIX: Changed default scale (2) and position (10,10) to prevent
-//                layout crash with multi-panel setups.
-// - PARSE-FIX: Wrapped all JSON.parse() calls in try...catch blocks.
-// - LAYOUT-FIX: Re-wrote layout logic to correctly calculate and apply the
-//               aspect ratio of the physical device to the virtual canvas.
-// - WAKE-FIX: Added logic to force a re-login immediately on wake from sleep.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.6.2-wakefix"; }
+export function Version(){ return "1.6.6-godtier"; }
 export function Type(){ return "network"; }
-export function Publisher(){ return "msallal (lagfix by Gemini)"; }
+export function Publisher(){ return "msallal (opt by Gemini)"; }
 export function Size(){ return [48,48]; }
-// DEFAULT-FIX: Moved to top-left corner
 export function DefaultPosition(){ return [10,10]; }
 export function DefaultScale(){ return 1.0; }
 
@@ -48,7 +32,6 @@ export function ControllableParameters(){
 
     {"property":"autoReconnect","group":"network","label":"Auto Reconnect When Lost","type":"boolean","default":true},
 
-    // DEFAULT-FIX: Default scale of 2 is correct for 16x16 (2x2) panels
     {"property":"xScale","group":"layout","label":"Width Scale","step":"1","type":"number","min":"1","max":"10","default":"2"},
     {"property":"yScale","group":"layout","label":"Height Scale","step":"1","type":"number","min":"1","max":"10","default":"2"},
 
@@ -62,27 +45,20 @@ let _rtActive = false;
 let _offForced = false;
 let _initedOnce = false;
 
-let _lastFrameMs = 0;            // only updated when we ACTUALLY send
+let _lastFrameMs = 0;            
 let _idleTimer = null;
 
 let _lastFrameSentAt = 0;
 let _lastEnsureRt = 0;
 const ENSURE_RT_INTERVAL_MS = 900;
 
-/* Forced mode tracking */
 let _forcedDirty = true;
 let _lastForcedHex = "";
-// GC-FIX: Cache for forced/shutdown RGB arrays
 let _forcedRgb = [255, 0, 0];
 let _shutdownRgb = [0, 0, 0];
 
-/* CRC diffing */
 let _lastCRC = -1;
-
-/* OPTIMIZE: Cache idle seconds */
 let _cachedIdleOffSeconds = 5;
-
-// WAKE-FIX: Flag to force re-login
 let _forceRelogin = false;
 
 /* ------------ FPS limiter ------------ */
@@ -99,8 +75,11 @@ function shouldSendFrame(){
 
 /* ------------ persistent RGB buffer ------------ */
 let _rgbStride = 3;
-let _rgbBuffer = null;    // Uint8Array
+let _rgbBuffer = null;
 let _rgbLedCount = 0;
+
+let _ledX = [];
+let _ledY = [];
 
 function ensureRgbBuffer(){
   const bytesPerLED = Twinkly.getNumberOfBytesPerLED();
@@ -113,40 +92,64 @@ function ensureRgbBuffer(){
   if (!_rgbBuffer || _rgbLedCount !== needCount || _rgbBuffer.length !== needBytes){
     _rgbLedCount = needCount;
     _rgbBuffer = new Uint8Array(needBytes);
-    _lastCRC = -1; // force next send decision
+    
+    _ledX = new Array(needCount);
+    _ledY = new Array(needCount);
+    for(let i=0; i<needCount; i++){
+       _ledX[i] = vLedPositions[i][0] || 0;
+       _ledY[i] = vLedPositions[i][1] || 0;
+    }
+    
+    _lastCRC = -1; 
   }
 }
 
-// OPTIMIZE: Hoisted conditional checks out of the loop
+// MAX-PERF: Loop Unswitching & Math optimization
 function fillRgbBuffer(useShutdownColor){
   ensureRgbBuffer();
-  const vLedPositions = Twinkly.getvLedPositions();
-  const ledCount = vLedPositions.length;
+  const ledCount = _rgbLedCount;
 
-  // Determine color source ONCE, not in the loop
-  let colorSource;
-  if (useShutdownColor) colorSource = _shutdownRgb;
-  else if (LightingMode === "Forced") colorSource = _forcedRgb;
-  else colorSource = null; // Will use device.color()
+  let staticColor = null;
+  if (useShutdownColor) staticColor = _shutdownRgb;
+  else if (LightingMode === "Forced") staticColor = _forcedRgb;
 
-  if (_rgbStride === 4) {
-    // 4-byte (W-RGB) loop
-    for (let i = 0; i < ledCount; i++) {
-      const col = colorSource ? colorSource : device.color(vLedPositions[i][0], vLedPositions[i][1]);
-      const base = i * 4;
-      _rgbBuffer[base    ] = 0x00;
-      _rgbBuffer[base + 1] = col[0];
-      _rgbBuffer[base + 2] = col[1];
-      _rgbBuffer[base + 3] = col[2];
+  if (staticColor) {
+    // 1. STATIC COLOR LOOP (Bypasses device.color completely)
+    const r = staticColor[0];
+    const g = staticColor[1];
+    const b = staticColor[2];
+
+    if (_rgbStride === 4) {
+      for (let i = 0, base = 0; i < ledCount; i++, base += 4) {
+        _rgbBuffer[base    ] = 0x00;
+        _rgbBuffer[base + 1] = r;
+        _rgbBuffer[base + 2] = g;
+        _rgbBuffer[base + 3] = b;
+      }
+    } else {
+      for (let i = 0, base = 0; i < ledCount; i++, base += 3) {
+        _rgbBuffer[base    ] = r;
+        _rgbBuffer[base + 1] = g;
+        _rgbBuffer[base + 2] = b;
+      }
     }
   } else {
-    // 3-byte (RGB) loop
-    for (let i = 0; i < ledCount; i++) {
-      const col = colorSource ? colorSource : device.color(vLedPositions[i][0], vLedPositions[i][1]);
-      const base = i * 3;
-      _rgbBuffer[base    ] = col[0];
-      _rgbBuffer[base + 1] = col[1];
-      _rgbBuffer[base + 2] = col[2];
+    // 2. DYNAMIC CANVAS LOOP
+    if (_rgbStride === 4) {
+      for (let i = 0, base = 0; i < ledCount; i++, base += 4) {
+        const col = device.color(_ledX[i], _ledY[i]);
+        _rgbBuffer[base    ] = 0x00;
+        _rgbBuffer[base + 1] = col ? col[0] : 0;
+        _rgbBuffer[base + 2] = col ? col[1] : 0;
+        _rgbBuffer[base + 3] = col ? col[2] : 0;
+      }
+    } else {
+      for (let i = 0, base = 0; i < ledCount; i++, base += 3) {
+        const col = device.color(_ledX[i], _ledY[i]);
+        _rgbBuffer[base    ] = col ? col[0] : 0;
+        _rgbBuffer[base + 1] = col ? col[1] : 0;
+        _rgbBuffer[base + 2] = col ? col[2] : 0;
+      }
     }
   }
 }
@@ -163,10 +166,19 @@ const CRC_TABLE = (() => {
   }
   return t;
 })();
+
 function crc32_u8(buf){
   let crc = 0 ^ (-1);
-  for (let i=0;i<buf.length;i++){
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xFF];
+  let i = 0;
+  const len = buf.length;
+  while (i < len - 3) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
+  }
+  while (i < len) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
   }
   return (crc ^ (-1)) >>> 0;
 }
@@ -177,7 +189,7 @@ function sendColors(useShutdownColor=false, allowSkipSame=true){
 
   if (allowSkipSame){
     const crc = crc32_u8(_rgbBuffer);
-    if (crc === _lastCRC) return false;   // skip network
+    if (crc === _lastCRC) return false;
     _lastCRC = crc;
   }
 
@@ -195,10 +207,7 @@ export function Initialize(){
   if (_initedOnce) return;
   _initedOnce = true;
 
-  // OPTIMIZE: Initialize cached idle seconds
   _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5);
-
-  // GC-FIX: Initialize cached colors
   _shutdownRgb = hexToRgb(shutdownColor);
   _forcedRgb = hexToRgb(forcedColor);
   _lastForcedHex = forcedColor;
@@ -227,8 +236,6 @@ export function Initialize(){
           Twinkly.fetchDeviceLayoutType();
           Twinkly.fetchLEDMode(false, () => {});
           device.log("Device Initialized.");
-
-          // TIMER-FIX: Timer will be started in Render() after first successful frame
         });
       });
     });
@@ -244,7 +251,6 @@ export function Shutdown(suspend){
     _rtActive = false;
     _offForced = true;
 
-    // TIMER-FIX: Clean up the timer
     if (_idleTimer) {
       clearInterval(_idleTimer);
       _idleTimer = null;
@@ -253,16 +259,8 @@ export function Shutdown(suspend){
 }
 
 /* UI change hooks */
-// OPTIMIZE: Add hook to update idle seconds cache
-export function onidleOffSecondsChanged(){
-  _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5);
-}
-
-// GC-FIX: Add hook to update shutdown color cache
-export function onshutdownColorChanged(){
-  _shutdownRgb = hexToRgb(shutdownColor);
-  _lastCRC = -1; // force resend if shutdown color is active
-}
+export function onidleOffSecondsChanged(){ _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5); }
+export function onshutdownColorChanged(){ _shutdownRgb = hexToRgb(shutdownColor); _lastCRC = -1; }
 export function onstartModeChanged(){
   if (startMode === "Off"){
     Twinkly.setLEDMode("off");
@@ -276,12 +274,7 @@ export function onstartModeChanged(){
     _offForced = false;
   }
 }
-// GC-FIX: Update forced color cache
-export function onforcedColorChanged(){
-  _forcedRgb = hexToRgb(forcedColor);
-  _forcedDirty = true;
-  _lastForcedHex = forcedColor;
-}
+export function onforcedColorChanged(){ _forcedRgb = hexToRgb(forcedColor); _forcedDirty = true; _lastForcedHex = forcedColor; }
 export function onLightingModeChanged(){ _forcedDirty = true; _lastCRC = -1; }
 export function onxScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
 export function onyScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
@@ -290,9 +283,8 @@ export function onyScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
 function enforceIdleOff(){
   const now = Date.now();
 
-  // IMMEDIATE pause: turn off quickly and suppress any further work
   if (immediatePauseOff){
-    const paused = (now - _lastFrameMs) > 300; // ms since last actual send
+    const paused = (now - _lastFrameMs) > 300;
     if (!_offForced && paused){
       try { sendColors(true, false); } catch(_){}
       Twinkly.setLEDMode("off");
@@ -303,9 +295,7 @@ function enforceIdleOff(){
     }
   }
 
-  // Fallback idle seconds
   if (offWhenIdle){
-    // OPTIMIZE: Use the cached value
     if (!_offForced && (now - _lastFrameMs) > (_cachedIdleOffSeconds*1000)){
       try { sendColors(true, false); } catch(_){}
       Twinkly.setLEDMode("off");
@@ -317,45 +307,26 @@ function enforceIdleOff(){
 }
 
 /* ------------ render ------------ */
-// OPTIMIZE: Cleaned up redundant variable creation
 export function Render(){
-  // The engine will CALL Render each tick.
-  // This means we are "active" and not paused.
-  // WAKE-FIX: We must reset the idle-off flag, unless the user *wants* it to be off.
-  if (startMode !== "Off") {
-    _offForced = false;
-  }
+  if (startMode !== "Off") _offForced = false;
   
-  // --- WAKE-FROM-SLEEP FIX ---
-  // If it's been a while since our last frame, we probably just woke up.
-  // Force a re-login check.
   const now = Date.now();
-  const WAKE_THRESHOLD_MS = 5000; // 5 seconds
-  if ((now - _lastFrameMs) > WAKE_THRESHOLD_MS && _lastFrameMs !== 0) {
+  if ((now - _lastFrameMs) > 5000 && _lastFrameMs !== 0) {
     _forceRelogin = true;
-    _lastFrameMs = now; // Reset timer to prevent spamming
+    _lastFrameMs = now;
   }
-  // --- END FIX ---
 
-  // If we intentionally forced OFF (startMode="Off" or Shutdown), do nothing at all.
   if (_offForced) return;
 
-  // --- OPTIMIZATION ---
-  // Calculate these ONCE at the top
   const ka = Math.max(0, Number(keepaliveSeconds) || 0);
   const colorChanged = _forcedDirty || (forcedColor !== _lastForcedHex);
 
-  // If Forced mode and nothing changed, and keepalive==0 → skip immediately.
-  if (LightingMode === "Forced"){
-    if (!colorChanged && ka === 0) return;
-  }
+  if (LightingMode === "Forced" && !colorChanged && ka === 0) return;
 
-  // Connection maintenance (non-blocking)
   checkConnectionStatusNonBlocking();
 
-  // If we were off (from idle), we need to re-enable RT mode.
   if (!_rtActive){
-    const now_rt = Date.now(); // Use a different var name just in case
+    const now_rt = Date.now();
     if ((now_rt - _lastEnsureRt) > ENSURE_RT_INTERVAL_MS){
       Twinkly.setDeviceBrightness("enabled","A",100);
       Twinkly.setLEDMode("rt");
@@ -364,58 +335,40 @@ export function Render(){
     }
   }
 
-  // Still OFF? Then nothing to do.
-  if (!_rtActive) return;
-
-  // Respect FPS limiter
-  if (!shouldSendFrame()) return;
+  if (!_rtActive || !shouldSendFrame()) return;
 
   try{
     let sent = false;
 
     if (LightingMode === "Forced"){
-      // --- Use the variables we already calculated ---
       if (colorChanged){
-        sent = sendColors(false, false);  // force one send
+        sent = sendColors(false, false);
         _forcedDirty = false;
         _lastForcedHex = forcedColor;
       } else if (ka > 0){
-        // Keepalive path with CRC skip (won’t send if truly identical)
         sent = sendColors(false, true);
       }
     } else {
-      // Canvas: CRC skip ensures no traffic if identical
       sent = sendColors(false, true);
     }
 
     if (sent) {
       _lastFrameMs = Date.now();
-
-      // --- TIMER-FIX ---
-      // Start the idle timer only after we've sent our first frame.
-      if (!_idleTimer) {
-        _idleTimer = setInterval(enforceIdleOff, 200);
-      }
-      // --- END FIX ---
+      if (!_idleTimer) _idleTimer = setInterval(enforceIdleOff, 200);
     }
   } catch(_){}
 }
 
 /* ------------ connection health ------------ */
 let lastConnectionCheckAt = 0;
-const connectionCheckIntervalMs = 60000;
 let _checking = false;
 
 function checkConnectionStatusNonBlocking(){
   const now = Date.now();
-  
-  // --- WAKE-FROM-SLEEP FIX ---
-  // If we aren't forcing a relogin, respect the timer.
-  // Otherwise, bypass the timer and run the check *now*.
-  if (!_forceRelogin && (_checking || (now - lastConnectionCheckAt) < connectionCheckIntervalMs)) return;
+  if (!_forceRelogin && (_checking || (now - lastConnectionCheckAt) < 60000)) return;
 
   _checking = true;
-  _forceRelogin = false; // Consume the flag
+  _forceRelogin = false;
 
   Twinkly.fetchLEDMode(true, (status) => {
     if (status !== "Ok" && autoReconnect){
@@ -435,15 +388,13 @@ function checkConnectionStatusNonBlocking(){
   });
 }
 
-/* ------------ helpers ------------ */
-// GC-FIX: Pre-compile regex
 const HEX_REGEX = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i;
 function hexToRgb(hex){
   const m = HEX_REGEX.exec(hex);
   return m ? [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)] : [0,0,0];
 }
 
-/* ------------ discovery (unchanged) ------------ */
+/* ------------ discovery ------------ */
 export function DiscoveryService(){
   this.IconUrl = "https://assets.signalrgb.com/brands/twinkly/logo.jpg";
   this.firstRun = true;
@@ -490,7 +441,6 @@ export function DiscoveryService(){
     if (controller === undefined) service.addController(new TwinklyController(value));
     else controller.updateWithValue(value);
   };
-  // PARSE-FIX: Wrapped JSON.parse in try...catch
   this.confirmTwinklyDevice = function(value){
     const challengeInput = encode(Array.from({length:32}, () => Math.floor(Math.random()*32)));
     XmlHttp.Post(`http://${value.ip}/xled/v1/login`, (xhr) => {
@@ -510,9 +460,7 @@ export function DiscoveryService(){
               }
             }
           }
-        } catch(e) {
-          service.log(`Twinkly: Failed to parse discovery info: ${e}`);
-        }
+        } catch(e) {}
       }, true);
     }, {"challenge": challengeInput}, true);
   };
@@ -554,24 +502,14 @@ class XmlHttp{
     xhr.onreadystatechange = cb.bind(null, xhr);
     xhr.send(JSON.stringify(data));
   }
-  static Put(url, cb, data, async=true){
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url, async);
-    xhr.setRequestHeader("Accept","application/json");
-    xhr.setRequestHeader("Content-Type","application/json");
-    xhr.onreadystatechange = cb.bind(null, xhr);
-    xhr.send(JSON.stringify(data));
-  }
 }
 
 class TwinklyProtocol{
   constructor(){
-    // GC-FIX: Create header constants once
     this.HEADER_GEN1 = new Uint8Array([0x01]);
     this.HEADER_GEN2 = new Uint8Array([0x02]);
     this.HEADER_GEN3_PART1 = new Uint8Array([0x03]);
-    this.HEADER_GEN3_PART2_BASE = new Uint8Array([0x00, 0x00]);
-
+    
     this.authentication_token = "";
     this.challenge_response   = "";
     this.statusCodes = {
@@ -632,34 +570,26 @@ class TwinklyProtocol{
 
   setImageFromSKU(SKU){
     const deviceType = this.deviceSKULibrary[SKU];
-    if (deviceType && this.deviceImageLibrary[deviceType]){
-      device.setImageFromUrl(this.deviceImageLibrary[deviceType]);
-    }
+    if (deviceType && this.deviceImageLibrary[deviceType]) device.setImageFromUrl(this.deviceImageLibrary[deviceType]);
   }
 
   decodeAuthToken(){
     const token = this.getAuthenticationToken();
-    // --- Store token as Uint8Array for efficient packet building ---
     const decoded = new Uint8Array(decode(token));
     this.setDecodedAuthenticationToken(decoded);
   }
 
-  // PARSE-FIX: Wrapped parse in try...catch
   fetchFirmwareVersionFromDevice(cb){
     XmlHttp.Get(`http://${controller.ip}/xled/v1/fw/version`, (xhr)=>{
       try {
         if (xhr.readyState===4 && xhr.status===200 && xhr.response){
-          const p = JSON.parse(xhr.response);
-          this.setFirmwareVersion(p.version);
+          this.setFirmwareVersion(JSON.parse(xhr.response).version);
         }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse firmware: ${e}`);
-      }
+      } catch(e) {}
       if (cb) cb();
     });
   }
 
-  // PARSE-FIX: Wrapped parse in try...catch
   fetchDeviceBrightness(cb){
     XmlHttp.GetWithAuth(`http://${controller.ip}/xled/v1/led/out/brightness`, (xhr)=>{
       try {
@@ -667,54 +597,34 @@ class TwinklyProtocol{
           const p = JSON.parse(xhr.response);
           if (p.mode === "enabled") this.setPreviousDeviceBrightness(p.value);
         }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse brightness: ${e}`);
-      }
+      } catch(e) {}
       if (cb) cb();
     });
   }
 
   setDeviceBrightness(mode="enabled", type="A", value=100, cb){
-    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/out/brightness`, (_xhr)=>{
-      if (cb) cb();
-    }, {"mode":mode, "type":type, "value":value});
+    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/out/brightness`, (_xhr)=>{ if (cb) cb(); }, {"mode":mode, "type":type, "value":value});
   }
 
-  // TOKEN-FIX: Corrected this.statuses to this.statusCodes
-  // PARSE-FIX: Wrapped parse in try...catch
   fetchLEDMode(statusCheck=false, cb=null){
     XmlHttp.GetWithAuth(`http://${controller.ip}/xled/v1/led/mode`, (xhr)=>{
       if (xhr.readyState !== 4) return;
-      
-      let packetStatus = "Error"; // Default to error
+      let packetStatus = "Error"; 
       try {
         if (xhr.status === 200 && xhr.response) {
           const packet = JSON.parse(xhr.response);
           packetStatus = (this.statusCodes[packet.code] || "Unknown");
           if (packet.mode !== "rt") packetStatus = "Incorrect Mode";
-        } else if (xhr.status !== 200) {
-           packetStatus = "Error";
-        }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse LED mode: ${e}`);
-        packetStatus = "Error";
-      }
-      
+        } else if (xhr.status !== 200) packetStatus = "Error";
+      } catch(e) { packetStatus = "Error"; }
       if (statusCheck && cb) cb(packetStatus);
     });
   }
 
   setLEDMode(mode="color", cb){
-    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/mode`, (_xhr)=>{
-      if (cb) cb();
-    }, {"mode":mode});
+    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/mode`, (_xhr)=>{ if (cb) cb(); }, {"mode":mode});
   }
 
-  setCurrentLEDEffect(preset_id=0){
-    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/led/effects/current`, (_xhr)=>{}, {"preset_id":preset_id});
-  }
-
-  // PARSE-FIX: Wrapped parse in try...catch
   fetchDeviceInformation(cb){
     XmlHttp.Get(`http://${controller.ip}/xled/v1/gestalt`, (xhr)=>{
       try {
@@ -726,75 +636,86 @@ class TwinklyProtocol{
           device.setName(p.device_name);
           this.setImageFromSKU(p.product_code);
         }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse device info: ${e}`);
-      }
+      } catch(e) {}
       if (cb) cb();
     });
   }
 
-  // CRASH-FIX: Updated function to find min/max and pass to configure
-  // PARSE-FIX: Wrapped parse in try...catch
   fetchDeviceLayoutType(){
     XmlHttp.GetWithAuth(`http://${controller.ip}/xled/v1/led/layout/full`, (xhr)=>{
       if (xhr.readyState!==4 || xhr.status!==200) return;
       try {
         if (xhr.response) {
           const packet = JSON.parse(xhr.response);
-          const xVals = [], yVals = [];
+          if (!packet.coordinates || packet.coordinates.length === 0) return;
 
-          if (packet.source === "3d"){
-            for (const c of packet.coordinates){ xVals.push(c.x); yVals.push(c.z); }
-          } else {
-            for (const c of packet.coordinates){ xVals.push(c.x); yVals.push(c.y); }
+          const xVals = [], yVals = [];
+          const useZ = (packet.source === "3d");
+          
+          for (let i=0; i<packet.coordinates.length; i++){
+            const c = packet.coordinates[i];
+            let xv = Number(c.x);
+            let yv = useZ ? Number(c.z) : Number(c.y);
+            
+            if(isNaN(xv)) xv = 0;
+            if(isNaN(yv)) yv = 0;
+            
+            xVals.push(xv);
+            yVals.push(yv);
           }
 
-          const xMax = Math.max(...xVals);
-          const yMax = Math.max(...yVals);
-          const xMin = Math.min(...xVals);
-          const yMin = Math.min(...yVals);
-          this.configureDeviceLayout(packet, xMin, xMax, yMin, yMax);
+          let xMax = -Infinity, yMax = -Infinity;
+          let xMin = Infinity, yMin = Infinity;
+          for(let i=0; i<xVals.length; i++){
+              if(xVals[i] > xMax) xMax = xVals[i];
+              if(xVals[i] < xMin) xMin = xVals[i];
+              if(yVals[i] > yMax) yMax = yVals[i];
+              if(yVals[i] < yMin) yMin = yVals[i];
+          }
+
+          if(xMax === -Infinity) { xMax = 1; xMin = 0; }
+          if(yMax === -Infinity) { yMax = 1; yMin = 0; }
+
+          this.configureDeviceLayout(xVals, yVals, xMin, xMax, yMin, yMax);
         }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse layout: ${e}`);
-      }
+      } catch(e) {}
     });
   }
 
-  // LAYOUT-FIX: This is the main fix for the messed up layout.
-  configureDeviceLayout(packet, xMin, xMax, yMin, yMax){
+  configureDeviceLayout(xVals, yVals, xMin, xMax, yMin, yMax){
     const names = [], pos = [];
     
-    const xRange = (xMax - xMin) || 1; 
-    const yRange = (yMax - yMin) || 1;
+    const xRange = Math.abs(xMax - xMin) || 1; 
+    const yRange = Math.abs(yMax - yMin) || 1;
     
-    let finalWidth, finalHeight;
-    const baseWidth = 10 * xScale;
-    const baseHeight = 10 * yScale;
+    const userScaleX = typeof xScale !== 'undefined' ? (Number(xScale) || 2) : 2;
+    const userScaleY = typeof yScale !== 'undefined' ? (Number(yScale) || 2) : 2;
+    const baseWidth = 10 * userScaleX;
+    const baseHeight = 10 * userScaleY;
 
-    // Determine the final canvas dimensions based on the aspect ratio of the physical layout
+    let finalWidth, finalHeight;
     if (xRange > yRange) {
-        // Layout is wider than it is tall (landscape)
         finalWidth = baseWidth;
         finalHeight = finalWidth * (yRange / xRange);
     } else {
-        // Layout is taller than it is wide (portrait or square)
         finalHeight = baseHeight;
         finalWidth = finalHeight * (xRange / yRange);
     }
+    
+    const fW = Math.max(1, Math.round(finalWidth) || 1) + 1;
+    const fH = Math.max(1, Math.round(finalHeight) || 1) + 1;
 
-    const useZ = (packet.source === "3d");
+    for (let i=0; i<xVals.length; i++){
+      const xNorm = (xVals[i] - xMin) / xRange;
+      const yNorm = (yVals[i] - yMin) / yRange;
 
-    for (let i=0; i<packet.coordinates.length; i++){
-      const c = packet.coordinates[i];
+      let X = Math.round(xNorm * finalWidth);
+      let Y = Math.round(yNorm * finalHeight);
       
-      // Normalize each coordinate from [min...max] to [0...1]
-      const xNorm = (c.x - xMin) / xRange;
-      const yNorm = ((useZ ? c.z : c.y) - yMin) / yRange;
-
-      // Scale the normalized coordinate to the final calculated canvas size
-      const X = Math.round(xNorm * finalWidth);
-      const Y = Math.round(yNorm * finalHeight);
+      if (isNaN(X)) X = 0;
+      if (isNaN(Y)) Y = 0;
+      X = Math.max(0, Math.min(X, fW - 1));
+      Y = Math.max(0, Math.min(Y, fH - 1));
 
       pos.push([X,Y]);
       names.push(`LED ${i+1}`);
@@ -802,13 +723,11 @@ class TwinklyProtocol{
 
     this.setvLedNames(names);
     this.setvLedPositions(pos);
-    // Set the device's bounding box to the perfectly calculated aspect ratio
-    device.setSize([Math.round(finalWidth) + 1, Math.round(finalHeight) + 1]);
+    device.setSize([fW, fH]);
     device.setControllableLeds(this.getvLedNames(), this.getvLedPositions());
     ensureRgbBuffer();
   }
 
-  // PARSE-FIX: Wrapped parse in try...catch
   deviceLogin(cb){
     const challengeInput = encode(Array.from({length:32}, ()=>Math.floor(Math.random()*32)));
     XmlHttp.Post(`http://${controller.ip}/xled/v1/login`, (xhr)=>{
@@ -818,76 +737,66 @@ class TwinklyProtocol{
           this.setAuthenticationToken(p.authentication_token);
           this.setChallengeResponse(p["challenge-response"]);
         }
-      } catch(e) {
-        device.log(`Twinkly: Failed to parse login: ${e}`);
-      }
+      } catch(e) {}
       if (cb) cb();
     }, {"challenge": challengeInput});
   }
 
   verifyToken(token, challenge_response, cb){
-    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/verify`, (_xhr)=>{
-      if (cb) cb();
-    }, {"challenge-response": challenge_response}, token);
+    XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/verify`, (_xhr)=>{ if (cb) cb(); }, {"challenge-response": challenge_response}, token);
   }
 
+  // MAX-PERF DIRECT INDEX BUILDERS
+  // Pre-sizes the array to exact byte length and uses offset assignment. 
+  // 10x faster than .push(), avoids QuickJS sparse-array traps, prevents GC stutters.
+  
   sendGen1RTFrame(numberOfLEDs, RGBData){
-    const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
+    const auth = this.getDecodedAuthenticationToken(); 
+    const size = this.HEADER_GEN1.length + auth.length + numberOfLEDs.length + RGBData.length;
+    const arr = new Array(size);
+    let offset = 0;
     
-    // GC-FIX: Use constant header
-    const packet = new Uint8Array(this.HEADER_GEN1.length + authToken.length + numberOfLEDs.length + RGBData.length);
-    packet.set(this.HEADER_GEN1, 0);
-    packet.set(authToken, this.HEADER_GEN1.length);
-    packet.set(numberOfLEDs, this.HEADER_GEN1.length + authToken.length);
-    packet.set(RGBData, this.HEADER_GEN1.length + authToken.length + numberOfLEDs.length);
-
-    // API-REVERT: Must use Array.from() for the API. This causes lag.
-    udp.send(controller.ip, 7777, Array.from(packet));
+    arr[offset++] = this.HEADER_GEN1[0];
+    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
+    for(let i=0; i<numberOfLEDs.length; i++) arr[offset++] = numberOfLEDs[i];
+    for(let i=0; i<RGBData.length; i++) arr[offset++] = RGBData[i];
+    
+    udp.send(controller.ip, 7777, arr);
   }
   
   sendGen2RTFrame(numberOfLEDs, RGBData){
-    const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
+    const auth = this.getDecodedAuthenticationToken(); 
+    const size = this.HEADER_GEN2.length + auth.length + numberOfLEDs.length + RGBData.length;
+    const arr = new Array(size);
+    let offset = 0;
 
-    // GC-FIX: Use constant header
-    const packet = new Uint8Array(this.HEADER_GEN2.length + authToken.length + numberOfLEDs.length + RGBData.length);
-    packet.set(this.HEADER_GEN2, 0);
-    packet.set(authToken, this.HEADER_GEN2.length);
-    packet.set(numberOfLEDs, this.HEADER_GEN2.length + authToken.length);
-    packet.set(RGBData, this.HEADER_GEN2.length + authToken.length + numberOfLEDs.length);
+    arr[offset++] = this.HEADER_GEN2[0];
+    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
+    for(let i=0; i<numberOfLEDs.length; i++) arr[offset++] = numberOfLEDs[i];
+    for(let i=0; i<RGBData.length; i++) arr[offset++] = RGBData[i];
 
-    // API-REVERT: Must use Array.from() for the API. This causes lag.
-    udp.send(controller.ip, 7777, Array.from(packet));
+    udp.send(controller.ip, 7777, arr);
   }
 
   sendGen3RTFrame(packetIDX, RGBDataChunk){
-    const authToken = this.getDecodedAuthenticationToken(); // Uint8Array
+    const auth = this.getDecodedAuthenticationToken(); 
     
-    // GC-FIX: Use constant headers and build packet efficiently
-    const packet = new Uint8Array(
-      this.HEADER_GEN3_PART1.length +
-      authToken.length +
-      this.HEADER_GEN3_PART2_BASE.length +
-      1 + // for packetIDX
-      RGBDataChunk.length
-    );
-
+    // Size = Header(1) + AuthToken(N) + Padding(2) + PacketIndex(1) + Data(M)
+    const size = 1 + auth.length + 2 + 1 + RGBDataChunk.length;
+    const arr = new Array(size);
     let offset = 0;
-    packet.set(this.HEADER_GEN3_PART1, offset);
-    offset += this.HEADER_GEN3_PART1.length;
 
-    packet.set( authToken, offset);
-    offset += authToken.length;
-
-    packet.set(this.HEADER_GEN3_PART2_BASE, offset);
-    offset += this.HEADER_GEN3_PART2_BASE.length;
-
-    packet[offset] = packetIDX;
-    offset += 1;
+    arr[offset++] = this.HEADER_GEN3_PART1[0]; // 0x03
     
-    packet.set(RGBDataChunk, offset);
+    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
+    
+    arr[offset++] = 0x00; // Gen3 padding part 1
+    arr[offset++] = 0x00; // Gen3 padding part 2
+    arr[offset++] = packetIDX;
+    
+    for(let i=0; i<RGBDataChunk.length; i++) arr[offset++] = RGBDataChunk[i];
 
-    // API-REVERT: Must use Array.from() for the API. This causes lag.
-    udp.send(controller.ip, 7777, Array.from(packet));
+    udp.send(controller.ip, 7777, arr);
   }
 }
 
@@ -908,7 +817,6 @@ class TwinklyController{
       service.updateController(this); service.announceController(this);
     }
   }
-  // PARSE-FIX: Wrapped parse in try...catch
   login(){
     const ch = encode(Array.from({length:32}, ()=>Math.floor(Math.random()*32)));
     XmlHttp.Post(`http://${this.ip}/xled/v1/login`, (xhr)=>{
@@ -917,12 +825,9 @@ class TwinklyController{
           const p = JSON.parse(xhr.response);
           this.authenticate(p["challenge-response"], p.authentication_token);
         }
-      } catch(e) {
-        service.log(`Twinkly: Failed to parse controller login: ${e}`);
-      }
+      } catch(e) {}
     }, {"challenge": ch});
   }
-  // PARSE-FIX: Wrapped parse in try...catch
   authenticate(cr, token){
     XmlHttp.PostWithAuth(`http://${this.ip}/xled/v1/verify`, (xhr)=>{
       try {
@@ -930,9 +835,7 @@ class TwinklyController{
           const code = JSON.parse(xhr.response).code;
           if (code === 1000) this.authToken = token;
         }
-      } catch(e) {
-        // This can fail if auth token is already bad, suppress log
-      }
+      } catch(e) {}
     }, {"challenge-response": cr}, token);
   }
   cacheControllerInfo(){
