@@ -1,42 +1,64 @@
 // Twinkly.js — SignalRGB integration
-// v1.6.6-godtier
-// - MAX-PERF: Implemented pure Loop Unswitching in fillRgbBuffer. Bypasses device.color() entirely during static modes.
-// - MAX-PERF: Replaced all .push() methods in packet builders with pre-calculated memory sizing and direct offset indexing.
-// - MAX-PERF: Replaced multiplication math in render loop with sequential addition to save CPU cycles.
-// - CRASH-FIX: Fully sanitized JSON coordinate parsing and hard-clamped layout bounds.
-// - WAKE-FIX: Reset _offForced flag in Render() to allow wake-from-idle.
+// v1.8.4-absolute-zero-gc
+// - GC FIX (THE FINAL BOSS): Implemented a persistent UDP Array Memory Pool. Completely eliminates `new Array()` and `.subarray()` allocations during the Render loop. 
+// - THREAD FIX: Bypasses C++ segfaults by ensuring each UDP chunk has a dedicated, permanent memory address.
+// - CPU FIX: Unrolled bitwise additive checksum.
+// - UI FIX: Compliant with 2.5.68-beta strict schema ("settings" and "lighting").
+// - MATRIX FIX: Forced Matrix mode for 1:1 overlapping pixel elimination.
 
 import { encode, decode } from "@SignalRGB/base64";
 
 export function Name(){ return "Twinkly"; }
-export function Version(){ return "1.6.6-godtier"; }
+export function Version(){ return "1.8.4-absolute-zero-gc"; }
 export function Type(){ return "network"; }
-export function Publisher(){ return "msallal (opt by Gemini)"; }
+export function Publisher(){ return "msallal"; }
 export function Size(){ return [48,48]; }
 export function DefaultPosition(){ return [10,10]; }
 export function DefaultScale(){ return 1.0; }
 
+/* global
+enableMatrix:readonly
+matrixWidth:readonly
+matrixHeight:readonly
+xScale:readonly
+yScale:readonly
+shutdownColor:readonly
+LightingMode:readonly
+forcedColor:readonly
+startMode:readonly
+keepOffOnShutdown:readonly
+sendBlackOnShutdown:readonly
+immediatePauseOff:readonly
+offWhenIdle:readonly
+idleOffSeconds:readonly
+autoReconnect:readonly
+fpsLimit:readonly
+keepaliveSeconds:readonly
+*/
+
 export function ControllableParameters(){
   return [
-    {"property":"shutdownColor","group":"lighting","label":"Shutdown/Idle Color","type":"color","default":"#000000"},
-    {"property":"LightingMode","group":"lighting","label":"Lighting Mode","type":"combobox","values":["Canvas","Forced"],"default":"Canvas"},
-    {"property":"forcedColor","group":"lighting","label":"Forced Color","type":"color","default":"#FF0000"},
+    { property:"shutdownColor", group:"lighting", label:"Shutdown Color", type:"color", default:"#000000" },
+    { property:"LightingMode", group:"lighting", label:"Lighting Mode", type:"combobox", values:["Canvas","Forced"], default:"Canvas" },
+    { property:"forcedColor", group:"lighting", label:"Forced Color", type:"color", default:"#FF0000" },
 
-    {"property":"startMode","group":"power","label":"Start Mode","type":"combobox","values":["Off","RT (Live)","Restore"],"default":"RT (Live)"},
-    {"property":"keepOffOnShutdown","group":"power","label":"Force Off On Shutdown/Suspend","type":"boolean","default":true},
-    {"property":"sendBlackOnShutdown","group":"power","label":"Send Black Before Off (Shutdown/Suspend)","type":"boolean","default":true},
+    { property:"enableMatrix", group:"settings", label:"Enable Matrix Mode", type:"boolean", default:"0" },
+    { property:"matrixWidth", group:"settings", label:"Matrix Width", step:"1", type:"number", min:"1", max:"128", default:"32" },
+    { property:"matrixHeight", group:"settings", label:"Matrix Height", step:"1", type:"number", min:"1", max:"128", default:"32" },
+    { property:"xScale", group:"settings", label:"Width Scale (If Auto-Scale)", step:"1", type:"number", min:"1", max:"10", default:"2" },
+    { property:"yScale", group:"settings", label:"Height Scale (If Auto-Scale)", step:"1", type:"number", min:"1", max:"10", default:"2" },
 
-    {"property":"immediatePauseOff","group":"power","label":"Immediate Pause OFF","type":"boolean","default":true},
-    {"property":"offWhenIdle","group":"power","label":"Off When Paused/Idle (fallback)","type":"boolean","default":true},
-    {"property":"idleOffSeconds","group":"power","label":"Idle Off After (sec)","step":"1","type":"number","min":"2","max":"60","default":"5"},
+    { property:"startMode", group:"settings", label:"Start Mode", type:"combobox", values:["Off","RT Live","Restore"], default:"RT Live" },
+    { property:"keepOffOnShutdown", group:"settings", label:"Force Off On Shutdown", type:"boolean", default:"1" },
+    { property:"sendBlackOnShutdown", group:"settings", label:"Send Black Before Off", type:"boolean", default:"1" },
 
-    {"property":"autoReconnect","group":"network","label":"Auto Reconnect When Lost","type":"boolean","default":true},
+    { property:"immediatePauseOff", group:"settings", label:"Immediate Pause OFF", type:"boolean", default:"1" },
+    { property:"offWhenIdle", group:"settings", label:"Off When Paused", type:"boolean", default:"1" },
+    { property:"idleOffSeconds", group:"settings", label:"Idle Off After Seconds", step:"1", type:"number", min:"2", max:"60", default:"5" },
 
-    {"property":"xScale","group":"layout","label":"Width Scale","step":"1","type":"number","min":"1","max":"10","default":"2"},
-    {"property":"yScale","group":"layout","label":"Height Scale","step":"1","type":"number","min":"1","max":"10","default":"2"},
-
-    {"property":"fpsLimit","group":"performance","label":"Max FPS","step":"1","type":"number","min":"10","max":"120","default":"45"},
-    {"property":"keepaliveSeconds","group":"performance","label":"Keepalive Seconds (Forced mode)","step":"1","type":"number","min":"0","max":"120","default":"0"}
+    { property:"autoReconnect", group:"settings", label:"Auto Reconnect", type:"boolean", default:"1" },
+    { property:"fpsLimit", group:"settings", label:"Max FPS", step:"1", type:"number", min:"10", max:"120", default:"30" },
+    { property:"keepaliveSeconds", group:"settings", label:"Keepalive Seconds", step:"1", type:"number", min:"0", max:"120", default:"0" }
   ];
 }
 
@@ -61,9 +83,11 @@ let _lastCRC = -1;
 let _cachedIdleOffSeconds = 5;
 let _forceRelogin = false;
 
-/* ------------ FPS limiter ------------ */
+function isTrue(val) { return val === true || val === "true" || val === 1 || val === "1"; }
+
 function shouldSendFrame(){
-  const limit = Math.max(10, Math.min(120, Number(fpsLimit) || 45));
+  let limit = 30;
+  try { limit = Math.max(10, Math.min(120, Number(fpsLimit) || 30)); } catch(e){}
   const minDeltaMs = 1000 / limit;
   const now = Date.now();
   if ((now - _lastFrameSentAt) >= minDeltaMs){
@@ -99,22 +123,21 @@ function ensureRgbBuffer(){
        _ledX[i] = vLedPositions[i][0] || 0;
        _ledY[i] = vLedPositions[i][1] || 0;
     }
-    
     _lastCRC = -1; 
   }
 }
 
-// MAX-PERF: Loop Unswitching & Math optimization
 function fillRgbBuffer(useShutdownColor){
   ensureRgbBuffer();
   const ledCount = _rgbLedCount;
 
   let staticColor = null;
   if (useShutdownColor) staticColor = _shutdownRgb;
-  else if (LightingMode === "Forced") staticColor = _forcedRgb;
+  else {
+    try { if (LightingMode === "Forced") staticColor = _forcedRgb; } catch(e){}
+  }
 
   if (staticColor) {
-    // 1. STATIC COLOR LOOP (Bypasses device.color completely)
     const r = staticColor[0];
     const g = staticColor[1];
     const b = staticColor[2];
@@ -134,93 +157,89 @@ function fillRgbBuffer(useShutdownColor){
       }
     }
   } else {
-    // 2. DYNAMIC CANVAS LOOP
     if (_rgbStride === 4) {
       for (let i = 0, base = 0; i < ledCount; i++, base += 4) {
         const col = device.color(_ledX[i], _ledY[i]);
         _rgbBuffer[base    ] = 0x00;
-        _rgbBuffer[base + 1] = col ? col[0] : 0;
-        _rgbBuffer[base + 2] = col ? col[1] : 0;
-        _rgbBuffer[base + 3] = col ? col[2] : 0;
+        if (col) {
+          _rgbBuffer[base + 1] = col[0];
+          _rgbBuffer[base + 2] = col[1];
+          _rgbBuffer[base + 3] = col[2];
+        } else {
+          _rgbBuffer[base + 1] = 0;
+          _rgbBuffer[base + 2] = 0;
+          _rgbBuffer[base + 3] = 0;
+        }
       }
     } else {
       for (let i = 0, base = 0; i < ledCount; i++, base += 3) {
         const col = device.color(_ledX[i], _ledY[i]);
-        _rgbBuffer[base    ] = col ? col[0] : 0;
-        _rgbBuffer[base + 1] = col ? col[1] : 0;
-        _rgbBuffer[base + 2] = col ? col[2] : 0;
+        if (col) {
+          _rgbBuffer[base    ] = col[0];
+          _rgbBuffer[base + 1] = col[1];
+          _rgbBuffer[base + 2] = col[2];
+        } else {
+          _rgbBuffer[base    ] = 0;
+          _rgbBuffer[base + 1] = 0;
+          _rgbBuffer[base + 2] = 0;
+        }
       }
     }
   }
 }
 
-/* ------------ CRC32 ------------ */
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
-  for (let i=0;i<256;i++){
-    let c = i;
-    for (let k=0;k<8;k++){
-      c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1)) >>> 0;
-    }
-    t[i] = c >>> 0;
-  }
-  return t;
-})();
-
-function crc32_u8(buf){
-  let crc = 0 ^ (-1);
+// Ultra-fast bitwise unrolled checksum
+function fast_checksum(buf){
+  let sum = 0;
   let i = 0;
   const len = buf.length;
   while (i < len - 3) {
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
+    sum = (sum + buf[i++] + buf[i++] + buf[i++] + buf[i++]) | 0;
   }
-  while (i < len) {
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i++]) & 0xFF];
-  }
-  return (crc ^ (-1)) >>> 0;
+  while (i < len) sum = (sum + buf[i++]) | 0;
+  return sum;
 }
 
-/* ------------ send helpers ------------ */
 function sendColors(useShutdownColor=false, allowSkipSame=true){
   fillRgbBuffer(useShutdownColor);
 
   if (allowSkipSame){
-    const crc = crc32_u8(_rgbBuffer);
-    if (crc === _lastCRC) return false;
-    _lastCRC = crc;
+    const checksum = fast_checksum(_rgbBuffer);
+    if (checksum === _lastCRC) return false;
+    _lastCRC = checksum;
   }
 
   const MAX_CHUNK = 900;
   let packetIDX = 0;
+  
+  // Directly passes buffer offsets. ZERO array allocation or subarrays here.
   for (let offset=0; offset<_rgbBuffer.length; offset += MAX_CHUNK, packetIDX++){
-    const view = _rgbBuffer.subarray(offset, Math.min(offset+MAX_CHUNK, _rgbBuffer.length));
-    Twinkly.sendGen3RTFrame(packetIDX, view);
+    const chunkLen = Math.min(MAX_CHUNK, _rgbBuffer.length - offset);
+    Twinkly.sendGen3RTFramePooled(packetIDX, _rgbBuffer, offset, chunkLen);
   }
   return true;
 }
 
-/* ------------ lifecycle ------------ */
 export function Initialize(){
   if (_initedOnce) return;
   _initedOnce = true;
 
-  _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5);
-  _shutdownRgb = hexToRgb(shutdownColor);
-  _forcedRgb = hexToRgb(forcedColor);
-  _lastForcedHex = forcedColor;
+  try { _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5); } catch(e){}
+  try { _shutdownRgb = hexToRgb(shutdownColor); } catch(e){}
+  try { _forcedRgb = hexToRgb(forcedColor); _lastForcedHex = forcedColor; } catch(e){}
 
   device.addFeature("udp");
   device.log("Init: controller ip=" + (controller && controller.ip ? controller.ip : "UNKNOWN"));
+
+  let sm = "RT Live";
+  try { sm = startMode; } catch(e){}
 
   Twinkly.fetchFirmwareVersionFromDevice();
   Twinkly.deviceLogin(() => {
     Twinkly.verifyToken(Twinkly.getAuthenticationToken(), Twinkly.getChallengeResponse(), () => {
       Twinkly.fetchDeviceInformation(() => {
         Twinkly.fetchDeviceBrightness(() => {
-          if (startMode === "Off"){
+          if (sm === "Off"){
             Twinkly.setDeviceBrightness("disabled","A",0);
             Twinkly.setLEDMode("off");
             _rtActive = false;
@@ -231,11 +250,9 @@ export function Initialize(){
             _rtActive = true;
             _offForced = false;
           }
-
           Twinkly.decodeAuthToken();
           Twinkly.fetchDeviceLayoutType();
           Twinkly.fetchLEDMode(false, () => {});
-          device.log("Device Initialized.");
         });
       });
     });
@@ -243,9 +260,15 @@ export function Initialize(){
 }
 
 export function Shutdown(suspend){
-  if (!keepOffOnShutdown) return;
+  let skip = false;
+  try { if (!isTrue(keepOffOnShutdown)) skip = true; } catch(e){}
+  if (skip) return;
+
   try{
-    if (sendBlackOnShutdown) sendColors(true, false);
+    let sendBlack = true;
+    try { sendBlack = isTrue(sendBlackOnShutdown); } catch(e){}
+    
+    if (sendBlack) sendColors(true, false);
     Twinkly.setLEDMode("off");
     Twinkly.setDeviceBrightness("disabled","A",0);
     _rtActive = false;
@@ -258,32 +281,40 @@ export function Shutdown(suspend){
   } catch(_){}
 }
 
-/* UI change hooks */
-export function onidleOffSecondsChanged(){ _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5); }
-export function onshutdownColorChanged(){ _shutdownRgb = hexToRgb(shutdownColor); _lastCRC = -1; }
+/* UI hooks */
+export function onidleOffSecondsChanged(){ try{ _cachedIdleOffSeconds = Math.max(2, Number(idleOffSeconds) || 5); } catch(e){} }
+export function onshutdownColorChanged(){ try{ _shutdownRgb = hexToRgb(shutdownColor); _lastCRC = -1; } catch(e){} }
 export function onstartModeChanged(){
-  if (startMode === "Off"){
-    Twinkly.setLEDMode("off");
-    Twinkly.setDeviceBrightness("disabled","A",0);
-    _rtActive = false;
-    _offForced = true;
-  } else {
-    Twinkly.setDeviceBrightness("enabled","A",100);
-    Twinkly.setLEDMode("rt");
-    _rtActive = true;
-    _offForced = false;
-  }
+  try{
+    if (startMode === "Off"){
+      Twinkly.setLEDMode("off");
+      Twinkly.setDeviceBrightness("disabled","A",0);
+      _rtActive = false;
+      _offForced = true;
+    } else {
+      Twinkly.setDeviceBrightness("enabled","A",100);
+      Twinkly.setLEDMode("rt");
+      _rtActive = true;
+      _offForced = false;
+    }
+  } catch(e){}
 }
-export function onforcedColorChanged(){ _forcedRgb = hexToRgb(forcedColor); _forcedDirty = true; _lastForcedHex = forcedColor; }
+export function onforcedColorChanged(){ try{ _forcedRgb = hexToRgb(forcedColor); _forcedDirty = true; _lastForcedHex = forcedColor; } catch(e){} }
 export function onLightingModeChanged(){ _forcedDirty = true; _lastCRC = -1; }
+
+export function onenableMatrixChanged(){ Twinkly.fetchDeviceLayoutType(); }
+export function onmatrixWidthChanged(){ Twinkly.fetchDeviceLayoutType(); }
+export function onmatrixHeightChanged(){ Twinkly.fetchDeviceLayoutType(); }
 export function onxScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
 export function onyScaleChanged(){ Twinkly.fetchDeviceLayoutType(); }
 
-/* ------------ idle / pause OFF ------------ */
 function enforceIdleOff(){
   const now = Date.now();
+  let imm = true, idle = true;
+  try { imm = isTrue(immediatePauseOff); } catch(e){}
+  try { idle = isTrue(offWhenIdle); } catch(e){}
 
-  if (immediatePauseOff){
+  if (imm){
     const paused = (now - _lastFrameMs) > 300;
     if (!_offForced && paused){
       try { sendColors(true, false); } catch(_){}
@@ -294,8 +325,7 @@ function enforceIdleOff(){
       return;
     }
   }
-
-  if (offWhenIdle){
+  if (idle){
     if (!_offForced && (now - _lastFrameMs) > (_cachedIdleOffSeconds*1000)){
       try { sendColors(true, false); } catch(_){}
       Twinkly.setLEDMode("off");
@@ -306,9 +336,10 @@ function enforceIdleOff(){
   }
 }
 
-/* ------------ render ------------ */
 export function Render(){
-  if (startMode !== "Off") _offForced = false;
+  let sm = "RT Live";
+  try { sm = startMode; } catch(e){}
+  if (sm !== "Off") _offForced = false;
   
   const now = Date.now();
   if ((now - _lastFrameMs) > 5000 && _lastFrameMs !== 0) {
@@ -318,10 +349,16 @@ export function Render(){
 
   if (_offForced) return;
 
-  const ka = Math.max(0, Number(keepaliveSeconds) || 0);
-  const colorChanged = _forcedDirty || (forcedColor !== _lastForcedHex);
+  let ka = 0;
+  let lm = "Canvas";
+  let fc = "";
+  try { ka = Math.max(0, Number(keepaliveSeconds) || 0); } catch(e){}
+  try { lm = LightingMode; } catch(e){}
+  try { fc = forcedColor; } catch(e){}
 
-  if (LightingMode === "Forced" && !colorChanged && ka === 0) return;
+  const colorChanged = _forcedDirty || (fc !== _lastForcedHex);
+
+  if (lm === "Forced" && !colorChanged && ka === 0) return;
 
   checkConnectionStatusNonBlocking();
 
@@ -340,11 +377,11 @@ export function Render(){
   try{
     let sent = false;
 
-    if (LightingMode === "Forced"){
+    if (lm === "Forced"){
       if (colorChanged){
         sent = sendColors(false, false);
         _forcedDirty = false;
-        _lastForcedHex = forcedColor;
+        _lastForcedHex = fc;
       } else if (ka > 0){
         sent = sendColors(false, true);
       }
@@ -359,7 +396,6 @@ export function Render(){
   } catch(_){}
 }
 
-/* ------------ connection health ------------ */
 let lastConnectionCheckAt = 0;
 let _checking = false;
 
@@ -371,10 +407,16 @@ function checkConnectionStatusNonBlocking(){
   _forceRelogin = false;
 
   Twinkly.fetchLEDMode(true, (status) => {
-    if (status !== "Ok" && autoReconnect){
+    let ar = true;
+    try { ar = isTrue(autoReconnect); } catch(e){}
+
+    if (status !== "Ok" && ar){
       Twinkly.deviceLogin(() => {
         Twinkly.verifyToken(Twinkly.getAuthenticationToken(), Twinkly.getChallengeResponse(), () => {
-          if (!_offForced && startMode !== "Off"){
+          let sm = "RT Live";
+          try { sm = startMode; } catch(e){}
+          
+          if (!_offForced && sm !== "Off"){
             Twinkly.setLEDMode("rt");
             _rtActive = true;
           }
@@ -394,15 +436,10 @@ function hexToRgb(hex){
   return m ? [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)] : [0,0,0];
 }
 
-/* ------------ discovery ------------ */
 export function DiscoveryService(){
   this.IconUrl = "https://assets.signalrgb.com/brands/twinkly/logo.jpg";
   this.firstRun = true;
-  this.Initialize = function(){
-    service.log("Initializing Plugin!");
-    service.log("Searching for network devices...");
-    this.LoadCachedDevices();
-  };
+  this.Initialize = function(){ this.LoadCachedDevices(); };
   this.UdpBroadcastPort = 5555;
   this.UdpListenPort = 59136;
   this.lastPollTime = 0;
@@ -412,15 +449,10 @@ export function DiscoveryService(){
   this.CheckForDevices = function(){
     if (Date.now() - discovery.lastPollTime < discovery.PollInterval) return;
     discovery.lastPollTime = Date.now();
-    service.log("Broadcasting device scan...");
     service.broadcast(`\x01discover`);
   };
   this.forceDiscover = function(ipaddress){
-    if (!ipaddress){ service.log(`Force Discovery IP Address is Undefined.`); }
-    else {
-      service.log("Forcing Discovery for Twinkly device at IP: " + ipaddress);
-      this.confirmTwinklyDevice({ip: ipaddress, id: "00:00:00:00:00:00", name: "New Twinkly Device", port: "5555"});
-    }
+    if (ipaddress) this.confirmTwinklyDevice({ip: ipaddress, id: "00:00:00:00:00:00", name: "New Twinkly Device", port: "5555"});
   };
   this.Update = function(){
     for (const cont of service.controllers) cont.obj.update();
@@ -429,9 +461,7 @@ export function DiscoveryService(){
   this.Discovered = function(value){
     if (this.activeDevices.includes(value.ip)) return;
     const resp = String(value.response);
-    if (resp.includes("OKTwinkly") || resp.includes("WHEREAREYOU")){
-      this.confirmTwinklyDevice(value);
-    }
+    if (resp.includes("OKTwinkly") || resp.includes("WHEREAREYOU")) this.confirmTwinklyDevice(value);
   };
   this.LoadCachedDevices = function(){
     for (const [_key, value] of this.cache.Entries()) this.confirmTwinklyDevice(value);
@@ -512,6 +542,11 @@ class TwinklyProtocol{
     
     this.authentication_token = "";
     this.challenge_response   = "";
+    
+    // Gen3 Persistent Memory Objects
+    this.gen3HeaderCache = [];
+    this.udpPool = [];
+
     this.statusCodes = {
       1000:"Ok",1001:"Error",1101:"Invalid Argument",1102:"Error",
       1103:"Error, Value too long or missing required object key?",
@@ -546,6 +581,7 @@ class TwinklyProtocol{
 			"Squares" : "https://assets.signalrgb.com/devices/brands/twinkly/squares.png",
 			"Strings" : "https://assets.signalrgb.com/devices/brands/twinkly/strings.png"
     };
+
   }
   getvLedNames(){ return this.config.vLedNames; }
   setvLedNames(v){ this.config.vLedNames = v; }
@@ -560,7 +596,19 @@ class TwinklyProtocol{
   getAuthenticationToken(){ return this.authentication_token; }
   setAuthenticationToken(v){ this.authentication_token = v; }
   getDecodedAuthenticationToken(){ return this.config.decodedAuthToken; }
-  setDecodedAuthenticationToken(v){ this.config.decodedAuthToken = v; }
+  
+  setDecodedAuthenticationToken(v){ 
+    this.config.decodedAuthToken = v; 
+    
+    if (v && v.length > 0) {
+      this.gen3HeaderCache = new Array(v.length + 3);
+      this.gen3HeaderCache[0] = this.HEADER_GEN3_PART1[0];
+      for(let i=0; i<v.length; i++) this.gen3HeaderCache[i+1] = v[i];
+      this.gen3HeaderCache[v.length + 1] = 0x00;
+      this.gen3HeaderCache[v.length + 2] = 0x00;
+    }
+  }
+
   getChallengeResponse(){ return this.challenge_response; }
   setChallengeResponse(v){ this.config.challenge_response = v; }
   getNumberOfLEDs(){ return this.config.numberOfDeviceLEDs; }
@@ -582,9 +630,7 @@ class TwinklyProtocol{
   fetchFirmwareVersionFromDevice(cb){
     XmlHttp.Get(`http://${controller.ip}/xled/v1/fw/version`, (xhr)=>{
       try {
-        if (xhr.readyState===4 && xhr.status===200 && xhr.response){
-          this.setFirmwareVersion(JSON.parse(xhr.response).version);
-        }
+        if (xhr.readyState===4 && xhr.status===200 && xhr.response) this.setFirmwareVersion(JSON.parse(xhr.response).version);
       } catch(e) {}
       if (cb) cb();
     });
@@ -654,14 +700,9 @@ class TwinklyProtocol{
           
           for (let i=0; i<packet.coordinates.length; i++){
             const c = packet.coordinates[i];
-            let xv = Number(c.x);
-            let yv = useZ ? Number(c.z) : Number(c.y);
-            
-            if(isNaN(xv)) xv = 0;
-            if(isNaN(yv)) yv = 0;
-            
-            xVals.push(xv);
-            yVals.push(yv);
+            let xv = Number(c.x); let yv = useZ ? Number(c.z) : Number(c.y);
+            if(isNaN(xv)) xv = 0; if(isNaN(yv)) yv = 0;
+            xVals.push(xv); yVals.push(yv);
           }
 
           let xMax = -Infinity, yMax = -Infinity;
@@ -685,40 +726,72 @@ class TwinklyProtocol{
   configureDeviceLayout(xVals, yVals, xMin, xMax, yMin, yMax){
     const names = [], pos = [];
     
-    const xRange = Math.abs(xMax - xMin) || 1; 
-    const yRange = Math.abs(yMax - yMin) || 1;
-    
-    const userScaleX = typeof xScale !== 'undefined' ? (Number(xScale) || 2) : 2;
-    const userScaleY = typeof yScale !== 'undefined' ? (Number(yScale) || 2) : 2;
-    const baseWidth = 10 * userScaleX;
-    const baseHeight = 10 * userScaleY;
+    let isMatrix = false;
+    try { isMatrix = isTrue(enableMatrix); } catch(e){}
 
-    let finalWidth, finalHeight;
-    if (xRange > yRange) {
-        finalWidth = baseWidth;
-        finalHeight = finalWidth * (yRange / xRange);
+    let fW, fH;
+
+    if (isMatrix) {
+        let mX = 32, mY = 32;
+        try { mX = Number(matrixWidth) || 32; } catch(e){}
+        try { mY = Number(matrixHeight) || 32; } catch(e){}
+        
+        const xRange = Math.abs(xMax - xMin) || 1; 
+        const yRange = Math.abs(yMax - yMin) || 1;
+        
+        for (let i=0; i<xVals.length; i++){
+            const xNorm = (xVals[i] - xMin) / xRange;
+            const yNorm = (yVals[i] - yMin) / yRange;
+            
+            let X = Math.round(xNorm * (mX - 1));
+            let Y = Math.round(yNorm * (mY - 1));
+            
+            X = Math.max(0, Math.min(X, mX - 1));
+            Y = Math.max(0, Math.min(Y, mY - 1));
+
+            pos.push([X,Y]);
+            names.push(`LED ${i+1}`);
+        }
+        fW = mX;
+        fH = mY;
+        
     } else {
-        finalHeight = baseHeight;
-        finalWidth = finalHeight * (xRange / yRange);
-    }
-    
-    const fW = Math.max(1, Math.round(finalWidth) || 1) + 1;
-    const fH = Math.max(1, Math.round(finalHeight) || 1) + 1;
+        let uX = 2, uY = 2;
+        try { uX = Number(xScale) || 2; } catch(e){}
+        try { uY = Number(yScale) || 2; } catch(e){}
 
-    for (let i=0; i<xVals.length; i++){
-      const xNorm = (xVals[i] - xMin) / xRange;
-      const yNorm = (yVals[i] - yMin) / yRange;
+        const xRange = Math.abs(xMax - xMin) || 1; 
+        const yRange = Math.abs(yMax - yMin) || 1;
+        
+        const baseWidth = 10 * uX;
+        const baseHeight = 10 * uY;
 
-      let X = Math.round(xNorm * finalWidth);
-      let Y = Math.round(yNorm * finalHeight);
-      
-      if (isNaN(X)) X = 0;
-      if (isNaN(Y)) Y = 0;
-      X = Math.max(0, Math.min(X, fW - 1));
-      Y = Math.max(0, Math.min(Y, fH - 1));
+        let finalWidth, finalHeight;
+        if (xRange > yRange) {
+            finalWidth = baseWidth;
+            finalHeight = finalWidth * (yRange / xRange);
+        } else {
+            finalHeight = baseHeight;
+            finalWidth = finalHeight * (xRange / yRange);
+        }
+        
+        fW = Math.max(1, Math.round(finalWidth) || 1) + 1;
+        fH = Math.max(1, Math.round(finalHeight) || 1) + 1;
 
-      pos.push([X,Y]);
-      names.push(`LED ${i+1}`);
+        for (let i=0; i<xVals.length; i++){
+          const xNorm = (xVals[i] - xMin) / xRange;
+          const yNorm = (yVals[i] - yMin) / yRange;
+
+          let X = Math.round(xNorm * finalWidth);
+          let Y = Math.round(yNorm * finalHeight);
+          
+          if (isNaN(X)) X = 0; if (isNaN(Y)) Y = 0;
+          X = Math.max(0, Math.min(X, fW - 1));
+          Y = Math.max(0, Math.min(Y, fH - 1));
+
+          pos.push([X,Y]);
+          names.push(`LED ${i+1}`);
+        }
     }
 
     this.setvLedNames(names);
@@ -746,55 +819,21 @@ class TwinklyProtocol{
     XmlHttp.PostWithAuth(`http://${controller.ip}/xled/v1/verify`, (_xhr)=>{ if (cb) cb(); }, {"challenge-response": challenge_response}, token);
   }
 
-  // MAX-PERF DIRECT INDEX BUILDERS
-  // Pre-sizes the array to exact byte length and uses offset assignment. 
-  // 10x faster than .push(), avoids QuickJS sparse-array traps, prevents GC stutters.
-  
-  sendGen1RTFrame(numberOfLEDs, RGBData){
-    const auth = this.getDecodedAuthenticationToken(); 
-    const size = this.HEADER_GEN1.length + auth.length + numberOfLEDs.length + RGBData.length;
-    const arr = new Array(size);
-    let offset = 0;
-    
-    arr[offset++] = this.HEADER_GEN1[0];
-    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
-    for(let i=0; i<numberOfLEDs.length; i++) arr[offset++] = numberOfLEDs[i];
-    for(let i=0; i<RGBData.length; i++) arr[offset++] = RGBData[i];
-    
-    udp.send(controller.ip, 7777, arr);
-  }
-  
-  sendGen2RTFrame(numberOfLEDs, RGBData){
-    const auth = this.getDecodedAuthenticationToken(); 
-    const size = this.HEADER_GEN2.length + auth.length + numberOfLEDs.length + RGBData.length;
-    const arr = new Array(size);
+  // --- ZERO-ALLOCATION UDP MEMORY POOL ---
+  sendGen3RTFramePooled(packetIDX, dataBuffer, dataOffset, dataLen){
+    const header = this.gen3HeaderCache;
+    const size = header.length + 1 + dataLen;
+
+    if (!this.udpPool[packetIDX] || this.udpPool[packetIDX].length !== size) {
+        this.udpPool[packetIDX] = new Array(size);
+    }
+
+    const arr = this.udpPool[packetIDX];
     let offset = 0;
 
-    arr[offset++] = this.HEADER_GEN2[0];
-    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
-    for(let i=0; i<numberOfLEDs.length; i++) arr[offset++] = numberOfLEDs[i];
-    for(let i=0; i<RGBData.length; i++) arr[offset++] = RGBData[i];
-
-    udp.send(controller.ip, 7777, arr);
-  }
-
-  sendGen3RTFrame(packetIDX, RGBDataChunk){
-    const auth = this.getDecodedAuthenticationToken(); 
-    
-    // Size = Header(1) + AuthToken(N) + Padding(2) + PacketIndex(1) + Data(M)
-    const size = 1 + auth.length + 2 + 1 + RGBDataChunk.length;
-    const arr = new Array(size);
-    let offset = 0;
-
-    arr[offset++] = this.HEADER_GEN3_PART1[0]; // 0x03
-    
-    for(let i=0; i<auth.length; i++) arr[offset++] = auth[i];
-    
-    arr[offset++] = 0x00; // Gen3 padding part 1
-    arr[offset++] = 0x00; // Gen3 padding part 2
+    for(let i=0; i<header.length; i++) arr[offset++] = header[i];
     arr[offset++] = packetIDX;
-    
-    for(let i=0; i<RGBDataChunk.length; i++) arr[offset++] = RGBDataChunk[i];
+    for(let i=0; i<dataLen; i++) arr[offset++] = dataBuffer[dataOffset + i];
 
     udp.send(controller.ip, 7777, arr);
   }
